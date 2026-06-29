@@ -87,15 +87,34 @@ impl AiInstallType {
     }
 }
 
-pub fn data_dir() -> PathBuf {
-    std::env::current_dir()
+fn dir_has_program_markers(dir: &Path) -> bool {
+    dir.join("ai_backend.py").exists()
+        || dir.join("installer_files").exists()
+        || dir.join("modules").exists()
+}
+
+/// Resolve the app's runtime root.
+fn resolve_runtime_root() -> PathBuf {
+    let cwd = std::env::current_dir().ok();
+    let exe_dir = std::env::current_exe()
         .ok()
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+
+    if let Some(cwd) = cwd.as_ref() {
+        if dir_has_program_markers(cwd) {
+            return cwd.clone();
+        }
+    }
+    if let Some(exe_dir) = exe_dir.as_ref() {
+        if dir_has_program_markers(exe_dir) {
+            return exe_dir.clone();
+        }
+    }
+    cwd.or(exe_dir).unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn data_dir() -> PathBuf {
+    resolve_runtime_root()
 }
 
 pub fn user_config_path() -> PathBuf {
@@ -120,14 +139,7 @@ pub fn flux_fill_inpaint_settings_path() -> PathBuf {
 }
 
 pub fn program_dir() -> PathBuf {
-    std::env::current_dir()
-        .ok()
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(Path::to_path_buf))
-        })
-        .unwrap_or_else(|| PathBuf::from("."))
+    resolve_runtime_root()
 }
 
 #[allow(dead_code)]
