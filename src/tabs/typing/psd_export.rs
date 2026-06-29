@@ -509,6 +509,7 @@ mod tests {
     };
     use ag_psd::read_psd;
     use ag_psd::psd::ReadOptions;
+    use cosmic_text::fontdb;
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -520,13 +521,58 @@ mod tests {
         v
     }
 
-    /// Реальный шрифт из репозитория с известным PostScript-именем `MaybugMSRegular`
-    /// (семейство — `Maybug MS`, т.е. PostScript-имя отличается от family и file stem,
-    /// что делает проверку осмысленной).
-    fn maybug_font_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("fonts")
-            .join("MaybugMSRegular.ttf")
+    /// Находит любой реальный системный шрифт и возвращает
+    /// `(path, face_index, postscript_name, family_name)` его первого face.
+    ///
+    /// Имена читаются ровно тем же способом, что и в резолвере
+    /// (`resolve_font_*`): файл грузится в изолированную `fontdb::Database`,
+    /// берётся face 0. Раньше тест зависел от `fonts/MaybugMSRegular.ttf`, который
+    /// не выкладывается в git (см. `.gitignore`), поэтому на чужом клоне падал;
+    /// системный шрифт есть на любой машине. Проверка остаётся осмысленной: мы
+    /// сверяем результат резолвера с именами, прочитанными из самого файла, и
+    /// убеждаемся, что экспорт берёт имя из файла, а не из UI-метки.
+    ///
+    /// Возвращает `None`, если в системе нет читаемых шрифтов — тогда тест
+    /// пропускается (например, на голом CI-контейнере без шрифтов).
+    fn system_font_for_test() -> Option<(String, usize, String, String)> {
+        let mut sys = fontdb::Database::new();
+        sys.load_system_fonts();
+        let mut paths: Vec<PathBuf> = sys
+            .faces()
+            .filter_map(|f| match &f.source {
+                fontdb::Source::File(p) => Some(p.clone()),
+                fontdb::Source::SharedFile(p, _) => Some(p.clone()),
+                fontdb::Source::Binary(_) => None,
+            })
+            .collect();
+        // Детерминированный порядок: одинаковый выбор шрифта между прогонами.
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let mut db = fontdb::Database::new();
+            if db.load_font_file(&path).is_err() {
+                continue;
+            }
+            let Some(face) = db.faces().next() else {
+                continue;
+            };
+            if face.post_script_name.is_empty() {
+                continue;
+            }
+            let Some((family, _)) = face.families.first() else {
+                continue;
+            };
+            if family.is_empty() {
+                continue;
+            }
+            return Some((
+                path.to_string_lossy().into_owned(),
+                0,
+                face.post_script_name.clone(),
+                family.clone(),
+            ));
+        }
+        None
     }
 
     #[test]
@@ -534,7 +580,13 @@ mod tests {
         let page_w = 32usize;
         let page_h = 24usize;
 
-        let font_path = maybug_font_path();
+        let (font_path, face_index, expected_ps, _expected_family) = match system_font_for_test() {
+            Some(v) => v,
+            None => {
+                eprintln!("системные шрифты недоступны, пропускаем тест");
+                return;
+            }
+        };
 
         // Оверлей A: чистый аффин с текстом.
         let ov_a = TypingExportOverlaySnapshot {
@@ -556,8 +608,8 @@ mod tests {
                     // Декорированная UI-метка не должна использоваться как имя шрифта,
                     // пока font_path указывает на реальный файл.
                     "font_label": "#0 Maybug | Normal | w400 | WRONG-LABEL-NAME",
-                    "font_path": font_path.to_string_lossy(),
-                    "selected_face_index": 0
+                    "font_path": font_path.clone(),
+                    "selected_face_index": face_index
                 }
             })),
             uid: "ov-a".into(),
@@ -658,7 +710,7 @@ mod tests {
             .and_then(|s| s.font.as_ref())
             .map(|f| f.name.as_str())
             .expect("A font");
-        assert_eq!(a_font_name, "MaybugMSRegular");
+        assert_eq!(a_font_name, expected_ps.as_str());
 
         // Слой B: скрытый текстовый + видимый растр.
         let b_text = &text_layers[1];
@@ -706,15 +758,22 @@ mod tests {
         assert_eq!(read_a_text.text, "Привет");
     }
 
-    /// Резолвер читает реальное PostScript-имя из файла шрифта.
+    /// Резолвер читает реальное PostScript-имя и семейство из файла шрифта.
     #[test]
     fn resolver_reads_real_postscript_name() {
-        let path = maybug_font_path();
-        let resolved = resolve_font_postscript_name(&path.to_string_lossy(), 0);
-        assert_eq!(resolved.as_deref(), Some("MaybugMSRegular"));
-        // Семейство отличается — фолбэк id 1.
-        let family = resolve_font_family_name(&path.to_string_lossy(), 0);
-        assert_eq!(family.as_deref(), Some("Maybug MS"));
+        let (path, face_index, expected_ps, expected_family) = match system_font_for_test() {
+            Some(v) => v,
+            None => {
+                eprintln!("системные шрифты недоступны, пропускаем тест");
+                return;
+            }
+        };
+        // PostScript-имя (name id 6) — то же, что прочитано из файла напрямую.
+        let resolved = resolve_font_postscript_name(&path, face_index);
+        assert_eq!(resolved.as_deref(), Some(expected_ps.as_str()));
+        // Семейство (name id 1) — фолбэк, когда PostScript-имя недоступно.
+        let family = resolve_font_family_name(&path, face_index);
+        assert_eq!(family.as_deref(), Some(expected_family.as_str()));
     }
 
     /// При неверном пути цепочка фолбэков доходит до PostScript-сегмента font_label.

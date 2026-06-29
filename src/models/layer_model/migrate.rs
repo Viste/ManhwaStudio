@@ -464,6 +464,20 @@ mod tests {
         dir
     }
 
+    /// Каталог снапшота инцидента ВВД/13 (`.bak`-копии text_info + живой
+    /// layers.json). Он машинно-специфичен и в репозиторий не коммитится, поэтому
+    /// путь берётся из переменной окружения `MS_VVD13_SNAPSHOT`, а не хардкодится.
+    /// Запуск, например:
+    ///   MS_VVD13_SNAPSHOT=/путь/к/vvd13_snapshot \
+    ///     cargo test models::layer_model::migrate::tests::forensic_repro_vvd13 \
+    ///       -- --ignored --nocapture
+    /// Если переменная не задана или каталог отсутствует — `None`, и тест
+    /// аккуратно пропускается (поэтому он переносим на любую машину).
+    fn vvd13_snapshot() -> Option<PathBuf> {
+        let path = PathBuf::from(std::env::var_os("MS_VVD13_SNAPSHOT")?);
+        path.is_dir().then_some(path)
+    }
+
     /// Writes a tiny PNG with a recognizable byte pattern (so we can prove bytes are preserved).
     fn write_png(path: &Path, w: u32, h: u32, rgba: [u8; 4]) {
         let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
@@ -560,11 +574,10 @@ mod tests {
     #[test]
     #[ignore = "forensic repro against the real ВВД/13 snapshot; run explicitly"]
     fn forensic_repro_vvd13() {
-        let snap = Path::new("/tmp/claude-1000/-home-vasyanator-hdd-Projects-ManhwaStudio/f696ad92-3cbf-4112-9043-69057eda940c/scratchpad/vvd13_snapshot");
-        if !snap.exists() {
-            eprintln!("snapshot missing, skipping");
+        let Some(snap) = vvd13_snapshot() else {
+            eprintln!("MS_VVD13_SNAPSHOT не задан или каталог отсутствует — пропускаем");
             return;
-        }
+        };
         let root = tmp("forensic");
         let layers = root.join("layers");
         let text_images = root.join("text_images");
@@ -612,11 +625,10 @@ mod tests {
         //   1. restore layers/text_info.json from the 184-overlay .bak,
         //   2. strip the inline TEXT nodes from layers.json (preserve the 2 page-0 rasters + groups),
         //   3. run the FIXED migration → 184 text nodes across 23 pages, rasters intact, _text.png reused.
-        let snap = Path::new("/tmp/claude-1000/-home-vasyanator-hdd-Projects-ManhwaStudio/f696ad92-3cbf-4112-9043-69057eda940c/scratchpad/vvd13_snapshot");
-        if !snap.exists() {
-            eprintln!("snapshot missing, skipping");
+        let Some(snap) = vvd13_snapshot() else {
+            eprintln!("MS_VVD13_SNAPSHOT не задан или каталог отсутствует — пропускаем");
             return;
-        }
+        };
         let root = tmp("recovery");
         let layers = root.join("layers");
         let text_images = root.join("text_images");
