@@ -365,6 +365,10 @@ pub struct TypingTopPanelState {
     edit_target: Option<TypingEditTarget>,
     edit_overlay_kind: Option<TypingOverlayKind>,
     edit_render_data_snapshot: Option<Value>,
+    /// Layer that owns the edit panel's saved inline text selection. Kept separate from
+    /// `edit_target` (which is nulled on deselection) so the selection survives losing focus and is
+    /// reset only when a genuinely different layer is selected.
+    inline_selection_owner: Option<TypingEditTarget>,
     mask_panel_open: bool,
     clean_overlays_visible: bool,
     clean_overlays_initialized: bool,
@@ -487,6 +491,7 @@ impl Default for TypingTopPanelState {
             edit_target: None,
             edit_overlay_kind: None,
             edit_render_data_snapshot: None,
+            inline_selection_owner: None,
             mask_panel_open: false,
             clean_overlays_visible: true,
             clean_overlays_initialized: false,
@@ -1056,6 +1061,15 @@ impl TypingTopPanelState {
                 let render_data_changed =
                     self.edit_render_data_snapshot != selected.render_data_json;
                 let target_changed = self.edit_target.as_ref() != Some(&selected.target);
+                // Сохранённое инлайн-выделение текста персонально для одного слоя.
+                // Сравниваем выбранный слой с владельцем выделения (а не с
+                // `edit_target`, который обнуляется при снятии выбора): иначе повторный
+                // выбор того же слоя после потери фокуса выглядел бы как смена слоя и
+                // терял бы выделение. Сбрасываем только при переходе на другой слой.
+                if self.inline_selection_owner.as_ref() != Some(&selected.target) {
+                    self.edit_panel.clear_inline_text_selection();
+                    self.inline_selection_owner = Some(selected.target.clone());
+                }
                 if target_changed || render_data_changed {
                     match selected.overlay_kind {
                         TypingOverlayKind::Text => {
@@ -1081,6 +1095,8 @@ impl TypingTopPanelState {
                 self.mode = TypingTopPanelMode::EditText;
             }
             None => {
+                // Снятие выбора НЕ сбрасывает инлайн-выделение: оно остаётся за своим
+                // слоем (см. `inline_selection_owner`), пока не выбран другой слой.
                 self.edit_overlay_idx = None;
                 self.edit_target = None;
                 self.edit_overlay_kind = None;
@@ -6691,7 +6707,9 @@ impl TypingCreatePanelState {
         }
     }
 
-    /// Сбрасывает текущее выделение (например, при переключении панов аккордеона).
+    /// Сбрасывает сохранённое инлайн-выделение текста. Вызывается при
+    /// переключении панов аккордеона и при смене редактируемого слоя, чтобы
+    /// выделение оставалось привязанным к одному оверлею.
     fn clear_inline_text_selection(&mut self) {
         self.text_selection_char_range = None;
         self.pending_text_selection_restore = None;
@@ -11343,5 +11361,58 @@ mod tests {
         state.select_font_by_path_or_label(Some("/fonts/Доступный.ttf"), Some("Доступный"));
         assert!(state.missing_font.is_none());
         assert_eq!(state.selected_font_idx, 0);
+    }
+
+    /// Строит выбранный текстовый оверлей без `render_data`, чтобы
+    /// `load_from_selected_overlay` не запускал тяжёлый разбор JSON в тесте.
+    fn text_overlay_for_edit(idx: usize) -> TypingSelectedOverlayForEdit {
+        TypingSelectedOverlayForEdit {
+            overlay_idx: idx,
+            overlay_kind: TypingOverlayKind::Text,
+            render_data_json: None,
+            width_px_hint: 100,
+            user_scale: 1.0,
+            rotation_deg: 0.0,
+            target: TypingEditTarget::Overlay(idx),
+        }
+    }
+
+    #[test]
+    fn inline_text_selection_is_scoped_to_a_single_layer() {
+        let mut state = TypingTopPanelState::default();
+
+        // Выбираем слой 0 и запоминаем выделение в поле редактирования.
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        state.edit_panel.text_selection_char_range = Some(2..5);
+
+        // Повторный выбор того же слоя сохраняет выделение.
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        assert_eq!(state.edit_panel.text_selection_char_range, Some(2..5));
+
+        // Выбор другого слоя сбрасывает выделение прошлого слоя.
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(1)));
+        assert_eq!(state.edit_panel.text_selection_char_range, None);
+        assert_eq!(state.edit_panel.pending_text_selection_restore, None);
+    }
+
+    #[test]
+    fn inline_text_selection_survives_deselect_and_reselect_of_same_layer() {
+        let mut state = TypingTopPanelState::default();
+
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        state.edit_panel.text_selection_char_range = Some(1..4);
+
+        // Снятие выбора (потеря фокуса) не должно терять выделение слоя.
+        state.sync_selected_overlay_for_edit(None);
+        assert_eq!(state.edit_panel.text_selection_char_range, Some(1..4));
+
+        // Повторный выбор того же слоя сохраняет выделение.
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        assert_eq!(state.edit_panel.text_selection_char_range, Some(1..4));
+
+        // Но переход на другой слой через снятие выбора всё равно сбрасывает.
+        state.sync_selected_overlay_for_edit(None);
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(1)));
+        assert_eq!(state.edit_panel.text_selection_char_range, None);
     }
 }
