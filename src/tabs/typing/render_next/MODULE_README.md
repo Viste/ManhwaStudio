@@ -9,6 +9,16 @@ JSON-driven effects.
 The renderer is pure rendering logic. It must not know about `CanvasView`, overlay
 placement, `text_info.json`, project storage, or GUI widgets.
 
+Architecture: glyph drawing is vector-first. Monochrome glyphs are rasterized
+from font outlines (`vector.rs` + shared pivot helpers in `glyph_blit.rs`) on all
+three draw paths — horizontal (`pipeline.rs`), vertical (`layout/vertical.rs`),
+and on-path/formula (`formula/render.rs`). `SwashCache::get_image` is kept only
+for color/emoji glyphs, the bitmap placement/bounds box that pins the outline
+pivot, and bitmap ink measurement.
+Shaping/layout/font matching stay on cosmic-text. History, the deferred
+direct-`rustybuzz` Phase 4, and the decision not to build a `TextDocument` facade
+are recorded in `VECTOR_ENGINE_REFACTOR.md`.
+
 ## Architecture
 The public boundary is intentionally small:
 
@@ -51,9 +61,28 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `inline_styles.rs`: parser/remapper for inline tags, attrs-compatible style spans, and
   line-level inline alignment markers.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
-  bilinear image sampling, and alpha-bounds trimming.
+  bilinear image sampling, and alpha-bounds trimming. Owns the color-glyph bitmap
+  fallback and bitmap-based measurement/bounds only; monochrome glyphs on all
+  three modes (horizontal, vertical, on-path/formula) are rasterized from outlines
+  instead.
+- `glyph_blit.rs`: shared outline-blit helpers (`hash_font_id`,
+  `resolve_outline_for_glyph`, `glyph_outline_transform`) used by the horizontal
+  path (`pipeline.rs`), the vertical path (`layout/vertical.rs`), and the
+  on-path/formula path (`formula/render.rs`) so the outline->world pivot lives in
+  one place.
 - `drawn_lines.rs`: raster layout-line tracing and vector-line path normalization for
   custom line layout modes.
+- `glyph_contour.rs`: placement (affine transform + AABB) and minimum-distance geometry
+  for glyph ink contours used by on-path minimum-distance spacing. The contours
+  themselves are produced by `vector::glyph_contour_from_outline`.
+- `vector.rs`: vector-glyph layer for the `VECTOR_ENGINE_REFACTOR.md` move — swash
+  outline extraction/flattening + cache, the single zeno coverage-mask rasterizer
+  (monochrome tint contract + `blend_pixel_over`), and `Outline`->`GlyphContour`
+  conversion. Wired into the on-path / formula / custom-line composite pass
+  (`formula/render.rs`), the horizontal path (`pipeline.rs`, including the
+  inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
+  shared `glyph_blit.rs` helpers; only color-glyph fallbacks and bitmap
+  measurement/bounds still use `raster.rs` bitmaps.
 - `wrap/`: text wrapping and hyphenation subsystem.
   See `wrap/MODULE_README.md`.
 - `layout/`: layout-to-raster positioning code that is not generic wrapping.
@@ -108,7 +137,11 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - To change caller-visible render parameters or result shape, start in `types.rs`, then
   update `mod.rs` smoke anchors and parent typing serialization/parsing.
 - To change normal horizontal rendering, glyph scaling, kerning, hanging punctuation,
-  line spacing, shape comparison, or routing, edit `pipeline.rs`.
+  line spacing, shape comparison, or routing, edit `pipeline.rs`. Horizontal
+  monochrome glyphs rasterize from outlines via `draw_horizontal_glyph` (normal)
+  and the `RotatedGlyphPlacement` draw pass (inline-rotated), both using
+  `glyph_blit::glyph_outline_transform`; the outline->world pivot lives in
+  `glyph_blit.rs`, not here.
 - To change wrapping behavior, edit `wrap/`; keep measurement/scoring in
   `horizontal.rs`, dictionary/safety rules in `hyphenation.rs`, shape profiles in
   `shape.rs`, and vertical pre-layout in `vertical.rs`.

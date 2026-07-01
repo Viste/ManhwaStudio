@@ -13,6 +13,10 @@ active-logs = []
 # and show the puffin_egui profiler window inside the editor.
 profiling = ["dep:puffin", "dep:puffin_egui"]
 
+[[bin]]
+name = "render_gallery"
+path = "src/bin/render_gallery/main.rs"
+
 [dependencies]
 anyhow = "1"
 arboard = "3"
@@ -21,6 +25,8 @@ clap = { version = "4", features = ["derive"] }
 eframe = "0.33"
 egui = "0.33"
 cosmic-text = "0.14"
+swash = "0.2"
+zeno = "0.3"
 hyphenation = { version = "0.8", features = ["embed_all"] }
 image = { version = "0.25", default-features = true }
 libloading = "0.8"

@@ -7,7 +7,16 @@ Vertical raster/layout path staged рендера typing.
 Main responsibilities:
 - превратить vertical `layout_text` и shaped glyph runs в колонки/cells;
 - посчитать column positions и vertical optical spacing без участия старого `render.rs`;
-- собрать итоговый `RenderedTextImage`, переиспользуя общий raster-слой.
+- собрать итоговый `RenderedTextImage`.
+
+Draw path:
+Each drawn glyph rasterizes its true font outline via the shared `glyph_blit`
+helpers (`resolve_outline_for_glyph` + `glyph_outline_transform`) and
+`vector::rasterize_outline_into`, placed on exactly the pixels the old swash
+bitmap blit produced (scale about the bitmap center, no rotation). Layout,
+bounds, optical spacing and visual-width measurement stay swash-bitmap based, so
+switching the draw is AA-only. Only COLR/bitmap color glyphs (no monochrome
+outline) fall back to the `raster.rs` bitmap blit.
 
 Source:
 - `render_vertical_text`
@@ -18,6 +27,9 @@ Source:
 из старого `src/tabs/typing/render.rs`
 */
 
+use crate::tabs::typing::render_next::glyph_blit::{
+    glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph,
+};
 use crate::tabs::typing::render_next::inline_styles::InlineStyleSpan;
 use crate::tabs::typing::render_next::pipeline::{
     GlyphScaleSettings, KerningSettings, inline_glyph_offset_for_glyph,
@@ -30,6 +42,7 @@ use crate::tabs::typing::render_next::raster::{
 use crate::tabs::typing::render_next::types::{
     RenderedTextImage, TextRenderParams, VerticalLineDirection,
 };
+use crate::tabs::typing::render_next::vector::{OutlineCache, rasterize_outline_into};
 use cosmic_text::{Buffer, FontSystem, LayoutGlyph, SwashCache};
 
 const OPTICAL_ALPHA_THRESHOLD: u8 = 24;
@@ -188,6 +201,9 @@ pub(crate) fn render_vertical_text(
     let x_offset = -bounds.min_x + horizontal_pad as i32 + safety_pad as i32;
     let y_offset = -bounds.min_y + vertical_pad as i32 + safety_pad as i32;
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
+    // Per-render outline cache: vertical cells rasterize the true font outline
+    // (mirroring the horizontal/on-path paths) instead of the swash bitmap.
+    let mut outline_cache = OutlineCache::new();
 
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
@@ -214,14 +230,59 @@ pub(crate) fn render_vertical_text(
             let Some(image) = cache.get_image(font_system, physical.cache_key) else {
                 continue;
             };
-            let draw_x = physical.x + image.placement.left + x_offset;
-            let draw_y = physical.y - image.placement.top + y_offset;
             let glyph_w = image.placement.width as usize;
             let glyph_h = image.placement.height as usize;
             if glyph_w == 0 || glyph_h == 0 {
                 continue;
             }
+            let placement_left = image.placement.left as f32;
+            let placement_top = image.placement.top as f32;
+            // World-space (pre-canvas-offset) top-left of the glyph bitmap, matching
+            // the bounds pass and the old bitmap blit's `src_left`/`src_top`.
+            let src_left = (physical.x + image.placement.left) as f32;
+            let src_top = (physical.y - image.placement.top) as f32;
 
+            // Prefer the true font outline: rasterize it at the exact world placement
+            // the bitmap blit used (scale about the bitmap center). Vertical cells are
+            // upright, so there is no glyph rotation (rot = 0). The canvas offset is
+            // folded into the rasterizer origin exactly as the horizontal path does.
+            if let Some(outline) =
+                resolve_outline_for_glyph(font_system, &mut outline_cache, glyph)
+            {
+                let dst_center_x = src_left + glyph_w as f32 * 0.5;
+                let dst_center_y = src_top + glyph_h as f32 * 0.5;
+                // Re-add the subpixel fraction baked into the bitmap coverage so the
+                // outline lands on the same pixels (physical.x/y are integer-only).
+                let transform = glyph_outline_transform(
+                    dst_center_x,
+                    dst_center_y,
+                    0.0,
+                    placement_left,
+                    placement_top,
+                    glyph_w as f32,
+                    glyph_h as f32,
+                    glyph_scale.width_mul,
+                    glyph_scale.height_mul,
+                    glyph_subpixel_offset(physical.cache_key),
+                );
+                rasterize_outline_into(
+                    rgba.as_mut_slice(),
+                    out_width as usize,
+                    out_height as usize,
+                    -(x_offset as f32),
+                    -(y_offset as f32),
+                    &outline,
+                    &transform,
+                    *text_color,
+                );
+                continue;
+            }
+
+            // No fillable outline: blit whatever non-empty bitmap `get_image` gave
+            // us — real color (COLR/bitmap) glyphs and monochrome embedded-bitmap /
+            // sbix / CBDT-mono glyphs alike (spaces are already filtered by size).
+            let draw_x = physical.x + image.placement.left + x_offset;
+            let draw_y = physical.y - image.placement.top + y_offset;
             if glyph_scale.is_identity() {
                 rasterize_unscaled_glyph(
                     rgba.as_mut_slice(),

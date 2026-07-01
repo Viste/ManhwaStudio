@@ -15,6 +15,11 @@ Main responsibilities:
 Notes:
 - inline-теги проходят через отдельный `inline_styles` слой как для attrs-level rich text,
   так и для glyph-level color/kerning/stretch/offset/line-spacing в horizontal path;
+- horizontal monochrome glyphs are rasterized from their true font outlines
+  (`draw_horizontal_glyph` for the normal path, the `RotatedGlyphPlacement` draw
+  pass for the inline-rotated path) via the shared `glyph_blit` helpers; the layout
+  math, bounds/canvas assembly and inline-color contract are unchanged, and color
+  glyphs keep the `raster.rs` bitmap blit;
 - `smoke_render_text_to_image` оставлен как бездисковая заглушка для runtime smoke-anchor;
 - основной источник поведения: `render_text_to_image`, `reshape_text_for_shape`,
   `build_vertical_layout_text`, `render_vertical_text`, `render_text_with_formula_layout`,
@@ -36,6 +41,7 @@ use super::inline_styles::{
     collect_requested_inline_font_labels, parse_inline_style_tags, remap_inline_style_spans,
     spans_have_attrs_overrides,
 };
+use super::glyph_blit::{glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph};
 use super::layout::{VerticalRasterRequest, render_vertical_text};
 use super::raster::{
     GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
@@ -43,6 +49,7 @@ use super::raster::{
     include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
     trim_rendered_image_to_alpha_bounds,
 };
+use super::vector::{Outline, OutlineCache, rasterize_outline_into};
 use super::types::{
     HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
     TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
@@ -795,6 +802,9 @@ pub fn render_text_to_image(
         (-bounds.min_y).saturating_add(i32::try_from(vertical_pad + safety_pad).unwrap_or(0));
 
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
+    // Per-render outline cache shared across the draw pass; extracts each glyph
+    // outline at most once and is unused by the bounds pass above.
+    let mut outline_cache = OutlineCache::new();
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
     while let Some(run) = runs.next() {
@@ -850,63 +860,21 @@ pub fn render_text_to_image(
                 run.line_i,
                 glyph,
             );
-            let physical = glyph.physical(
-                (
-                    line_offset_x + (glyph_x - glyph.x) + glyph_offset[0],
-                    baseline_y + glyph_offset[1],
-                ),
-                1.0,
+            draw_horizontal_glyph(
+                rgba.as_mut_slice(),
+                out_width,
+                out_height,
+                &mut font_system,
+                &mut cache,
+                &mut outline_cache,
+                glyph,
+                line_offset_x + (glyph_x - glyph.x) + glyph_offset[0],
+                baseline_y + glyph_offset[1],
+                glyph_scale,
+                glyph_text_color,
+                x_offset,
+                y_offset,
             );
-            let Some(image) = cache.get_image(&mut font_system, physical.cache_key) else {
-                continue;
-            };
-
-            let draw_x = physical.x + image.placement.left + x_offset;
-            let draw_y = physical.y - image.placement.top + y_offset;
-            let glyph_w = image.placement.width as usize;
-            let glyph_h = image.placement.height as usize;
-            if glyph_w == 0 || glyph_h == 0 {
-                continue;
-            }
-
-            if glyph_scale.is_identity() {
-                rasterize_unscaled_glyph(
-                    rgba.as_mut_slice(),
-                    out_width,
-                    out_height,
-                    image.content,
-                    image.data.as_slice(),
-                    glyph_w,
-                    glyph_h,
-                    draw_x,
-                    draw_y,
-                    glyph_text_color,
-                );
-            } else {
-                let glyph_rgba = build_glyph_rgba_buffer(
-                    &image.content,
-                    image.data.as_slice(),
-                    glyph_w,
-                    glyph_h,
-                    glyph_text_color,
-                );
-                let mut canvas = RgbaCanvasView {
-                    rgba: rgba.as_mut_slice(),
-                    width: out_width as usize,
-                    height: out_height as usize,
-                };
-                draw_scaled_glyph_rgba(
-                    &mut canvas,
-                    GlyphRgbaView {
-                        rgba: glyph_rgba.as_slice(),
-                        width: glyph_w,
-                        height: glyph_h,
-                    },
-                    draw_x as f32,
-                    draw_y as f32,
-                    glyph_scale,
-                );
-            }
         }
 
         if run_wraps_at_soft_hyphen(&run, runs.peek())
@@ -955,57 +923,21 @@ pub fn render_text_to_image(
                     .zip(run.glyphs.last())
                     .map(|(glyph_x, last_glyph)| glyph_x - last_glyph.x)
                     .unwrap_or(0.0);
-            let hyphen_physical = hyphen_glyph.physical(
-                (
-                    hyphen_offset_x + hyphen_offset[0],
-                    baseline_y + hyphen_offset[1],
-                ),
-                1.0,
+            draw_horizontal_glyph(
+                rgba.as_mut_slice(),
+                out_width,
+                out_height,
+                &mut font_system,
+                &mut cache,
+                &mut outline_cache,
+                &hyphen_glyph,
+                hyphen_offset_x + hyphen_offset[0],
+                baseline_y + hyphen_offset[1],
+                hyphen_scale,
+                hyphen_text_color,
+                x_offset,
+                y_offset,
             );
-            if let Some(image) = cache.get_image(&mut font_system, hyphen_physical.cache_key) {
-                let draw_x = hyphen_physical.x + image.placement.left + x_offset;
-                let draw_y = hyphen_physical.y - image.placement.top + y_offset;
-                let glyph_w = image.placement.width as usize;
-                let glyph_h = image.placement.height as usize;
-                if hyphen_scale.is_identity() {
-                    rasterize_unscaled_glyph(
-                        rgba.as_mut_slice(),
-                        out_width,
-                        out_height,
-                        image.content,
-                        image.data.as_slice(),
-                        glyph_w,
-                        glyph_h,
-                        draw_x,
-                        draw_y,
-                        hyphen_text_color,
-                    );
-                } else {
-                    let glyph_rgba = build_glyph_rgba_buffer(
-                        &image.content,
-                        image.data.as_slice(),
-                        glyph_w,
-                        glyph_h,
-                        hyphen_text_color,
-                    );
-                    let mut canvas = RgbaCanvasView {
-                        rgba: rgba.as_mut_slice(),
-                        width: out_width as usize,
-                        height: out_height as usize,
-                    };
-                    draw_scaled_glyph_rgba(
-                        &mut canvas,
-                        GlyphRgbaView {
-                            rgba: glyph_rgba.as_slice(),
-                            width: glyph_w,
-                            height: glyph_h,
-                        },
-                        draw_x as f32,
-                        draw_y as f32,
-                        hyphen_scale,
-                    );
-                }
-            }
         }
         line_idx += 1;
     }
@@ -1023,15 +955,145 @@ pub fn render_text_to_image(
     Ok(rendered)
 }
 
-/// Одно размещение глифа для пути с поворотами: исходный bitmap, масштаб, центр в
+/// Draw one horizontal (unrotated) glyph into the output canvas.
+///
+/// Rasterizes the glyph's true font outline at exactly the pixels the bitmap
+/// blit used: scaled about the bitmap center (`dst_center`), no rotation, world
+/// mapped to the canvas by the `x_offset`/`y_offset` used by the bounds pass.
+/// `pos_x`/`pos_y` are the glyph pen position in layout pixels (already carrying
+/// the inline glyph offset). Color/emoji glyphs have no monochrome outline and
+/// keep the bitmap blit (identity or center-scaled); ordinary empty glyphs
+/// (zero-size placement) draw nothing.
+// The blit call site naturally carries the raster target, glyph, pen position,
+// scale, color and canvas offsets; bundling them would obscure the mapping.
+#[allow(clippy::too_many_arguments)]
+fn draw_horizontal_glyph(
+    rgba: &mut [u8],
+    out_width: u32,
+    out_height: u32,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    glyph: &LayoutGlyph,
+    pos_x: f32,
+    pos_y: f32,
+    glyph_scale: GlyphScaleSettings,
+    text_color: [u8; 4],
+    x_offset: i32,
+    y_offset: i32,
+) {
+    let physical = glyph.physical((pos_x, pos_y), 1.0);
+    let Some(image) = cache.get_image(font_system, physical.cache_key) else {
+        return;
+    };
+    let glyph_w = image.placement.width as usize;
+    let glyph_h = image.placement.height as usize;
+    if glyph_w == 0 || glyph_h == 0 {
+        return;
+    }
+    let placement_left = image.placement.left as f32;
+    let placement_top = image.placement.top as f32;
+    // Content-space top-left of the (unscaled) glyph bitmap, matching the bounds
+    // pass and the bitmap blit's `src_left`/`src_top`.
+    let src_left = (physical.x + image.placement.left) as f32;
+    let src_top = (physical.y - image.placement.top) as f32;
+
+    // Prefer the true font outline: rasterize it at the exact world placement the
+    // bitmap blit would have used (scale about the bitmap center, no rotation).
+    if let Some(outline) = resolve_outline_for_glyph(font_system, outline_cache, glyph) {
+        let dst_center_x = src_left + glyph_w as f32 * 0.5;
+        let dst_center_y = src_top + glyph_h as f32 * 0.5;
+        // Re-add the subpixel fraction cosmic-text baked into the bitmap coverage
+        // (physical.x/y carry only the integer pen), so the outline matches it.
+        let transform = glyph_outline_transform(
+            dst_center_x,
+            dst_center_y,
+            0.0,
+            placement_left,
+            placement_top,
+            glyph_w as f32,
+            glyph_h as f32,
+            glyph_scale.width_mul,
+            glyph_scale.height_mul,
+            glyph_subpixel_offset(physical.cache_key),
+        );
+        rasterize_outline_into(
+            rgba,
+            out_width as usize,
+            out_height as usize,
+            -(x_offset as f32),
+            -(y_offset as f32),
+            &outline,
+            &transform,
+            text_color,
+        );
+        return;
+    }
+
+    // No fillable outline (real color glyph, or a monochrome embedded-bitmap /
+    // sbix / CBDT-mono glyph): blit whatever non-empty bitmap `get_image` gave us
+    // — spaces are already filtered by the zero-size check above. Dropping this on
+    // a non-color glyph would silently lose embedded-bitmap-only glyphs.
+    let draw_x = physical.x + image.placement.left + x_offset;
+    let draw_y = physical.y - image.placement.top + y_offset;
+    if glyph_scale.is_identity() {
+        rasterize_unscaled_glyph(
+            rgba,
+            out_width,
+            out_height,
+            image.content,
+            image.data.as_slice(),
+            glyph_w,
+            glyph_h,
+            draw_x,
+            draw_y,
+            text_color,
+        );
+    } else {
+        let glyph_rgba =
+            build_glyph_rgba_buffer(&image.content, image.data.as_slice(), glyph_w, glyph_h, text_color);
+        let mut canvas = RgbaCanvasView {
+            rgba,
+            width: out_width as usize,
+            height: out_height as usize,
+        };
+        draw_scaled_glyph_rgba(
+            &mut canvas,
+            GlyphRgbaView {
+                rgba: glyph_rgba.as_slice(),
+                width: glyph_w,
+                height: glyph_h,
+            },
+            draw_x as f32,
+            draw_y as f32,
+            glyph_scale,
+        );
+    }
+}
+
+/// Одно размещение глифа для пути с поворотами: векторный outline (когда есть),
+/// исходный bitmap для fallback цветных глифов, масштаб, placement, центр в
 /// координатах контента, итоговый поворот и принадлежность к группе.
+///
+/// `outline` is the glyph's true font outline; when present the draw pass
+/// rasterizes it and `glyph_rgba` stays empty. `glyph_rgba` backs the bitmap
+/// fallback for any outline-less glyph (real color glyph or a monochrome
+/// embedded-bitmap glyph), built only when the outline is absent.
+/// `placement_left`/`placement_top` feed the outline->world pivot.
 struct RotatedGlyphPlacement {
+    outline: Option<Arc<Outline>>,
     glyph_rgba: Vec<u8>,
     glyph_w: usize,
     glyph_h: usize,
     src_left: f32,
     src_top: f32,
+    placement_left: f32,
+    placement_top: f32,
     scale: GlyphScaleSettings,
+    text_color: [u8; 4],
+    /// Subpixel fraction baked into the swash bitmap coverage; re-applied to the
+    /// outline placement only (the bitmap fallback already carries it).
+    subpixel: [f32; 2],
     center_x: f32,
     center_y: f32,
     rotation_rad: f32,
@@ -1043,6 +1105,7 @@ struct RotatedGlyphPlacement {
 fn build_rotated_placement(
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
     glyph: &LayoutGlyph,
     pos_x: f32,
     pos_y: f32,
@@ -1061,19 +1124,34 @@ fn build_rotated_placement(
     if glyph_w == 0 || glyph_h == 0 {
         return None;
     }
+    let placement_left = image.placement.left as f32;
+    let placement_top = image.placement.top as f32;
     let src_left = (physical.x + image.placement.left) as f32;
     let src_top = (physical.y - image.placement.top) as f32;
-    let glyph_rgba =
-        build_glyph_rgba_buffer(&image.content, image.data.as_slice(), glyph_w, glyph_h, text_color);
+    let subpixel = glyph_subpixel_offset(physical.cache_key);
+    let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph);
+    // Build the bitmap RGBA for any outline-less glyph fallback: real color glyphs
+    // and monochrome embedded-bitmap / sbix / CBDT-mono glyphs alike (the zero-size
+    // skip above already filtered spaces).
+    let glyph_rgba = if outline.is_none() {
+        build_glyph_rgba_buffer(&image.content, image.data.as_slice(), glyph_w, glyph_h, text_color)
+    } else {
+        Vec::new()
+    };
     let (scaled_left, scaled_top, scaled_width, scaled_height) =
         scale.scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
     Some(RotatedGlyphPlacement {
+        outline,
         glyph_rgba,
         glyph_w,
         glyph_h,
         src_left,
         src_top,
+        placement_left,
+        placement_top,
         scale,
+        text_color,
+        subpixel,
         center_x: scaled_left + scaled_width * 0.5,
         center_y: scaled_top + scaled_height * 0.5,
         rotation_rad: glyph_rotation_rad,
@@ -1131,6 +1209,8 @@ fn render_horizontal_rotated(
     cancel: Option<(&Arc<AtomicU64>, u64)>,
 ) -> Result<RenderedTextImage, String> {
     let mut cache = SwashCache::new();
+    // Per-render outline cache: each glyph outline is extracted at most once.
+    let mut outline_cache = OutlineCache::new();
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
     let inline_line_aligns =
         compute_inline_line_aligns(params.align, layout_text, inline_style_spans);
@@ -1203,6 +1283,7 @@ fn render_horizontal_rotated(
             if let Some(placement) = build_rotated_placement(
                 font_system,
                 &mut cache,
+                &mut outline_cache,
                 glyph,
                 line_offset_x + (glyph_x - glyph.x) + offset.global_px[0],
                 baseline_y + offset.global_px[1],
@@ -1258,6 +1339,7 @@ fn render_horizontal_rotated(
             if let Some(placement) = build_rotated_placement(
                 font_system,
                 &mut cache,
+                &mut outline_cache,
                 &hyphen_glyph,
                 hyphen_offset_x + hyphen_offset.global_px[0],
                 baseline_y + hyphen_offset.global_px[1],
@@ -1316,6 +1398,36 @@ fn render_horizontal_rotated(
         if is_cancelled(cancel) {
             return Err("render_next render cancelled".to_string());
         }
+        // Prefer the true font outline, rasterized at the same rotated/scaled
+        // world placement the bitmap blit would have used (dst_center =
+        // placement.center after group rotation).
+        if let Some(outline) = placement.outline.as_ref() {
+            let transform = glyph_outline_transform(
+                placement.center_x,
+                placement.center_y,
+                placement.rotation_rad,
+                placement.placement_left,
+                placement.placement_top,
+                placement.glyph_w as f32,
+                placement.glyph_h as f32,
+                placement.scale.width_mul,
+                placement.scale.height_mul,
+                placement.subpixel,
+            );
+            rasterize_outline_into(
+                rgba.as_mut_slice(),
+                out_width as usize,
+                out_height as usize,
+                -(x_offset as f32),
+                -(y_offset as f32),
+                outline,
+                &transform,
+                placement.text_color,
+            );
+            continue;
+        }
+        // No fillable outline: blit the fallback bitmap for any outline-less glyph
+        // (real color glyph or a monochrome embedded-bitmap glyph).
         let mut canvas = RgbaCanvasView {
             rgba: rgba.as_mut_slice(),
             width: out_width as usize,

@@ -9,6 +9,24 @@ Main responsibilities:
 - собирать formula-specific glyph metadata, arc-length mapping и rotated bounds/draw;
 - отдельно обрабатывать fallback для `TextLayoutMode::Shape`, когда кривая слишком короткая.
 
+Glyph rasterization (formula + custom-line composite pass):
+- Each placed glyph is drawn by rasterizing its true font outline
+  (`render_next/vector.rs`) directly into the output via
+  `glyph_blit::glyph_outline_transform` (the shared single source of truth for the
+  outline->world pivot, also used by the horizontal path) + `rasterize_outline_into`.
+- COLR/bitmap color glyphs have no monochrome outline (`resolve_glyph_outline`
+  returns `None`); those keep the legacy rotated bitmap blit.
+
+Glyph-ink spacing (MinimumPreviousDistance mode):
+- `seed_ink_geometry`/`CachedGlyphInk` derive a glyph's ink contour from its outline
+  (`glyph_contour_from_outline`, cached by cosmic-text `CacheKey`) plus a horizontal
+  ink extent still measured from the rasterized bitmap.
+- `drawn_line_transform_at` is the single source of truth for the on-path transform;
+  `placed_contour_for_transform` places the outline-frame contour with the same
+  `glyph_outline_transform` pivot the rasterizer uses, and
+  `find_minimum_ink_distance_center_s` advances the arc-length position until the true
+  ink-to-ink gap reaches `target_gap` (kerning-driven).
+
 Source:
 - `render_text_with_formula_layout`
 - `render_text_with_formula_layout_once`
@@ -25,6 +43,15 @@ use crate::tabs::typing::render_next::drawn_lines::{
     DrawnLinePath, build_vector_line_paths, load_raster_line_paths,
 };
 use crate::tabs::typing::render_next::font_registry::InlineFontRegistry;
+use crate::tabs::typing::render_next::glyph_blit::{
+    glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph,
+};
+use crate::tabs::typing::render_next::glyph_contour::{
+    GlyphContour, PlacedContour, min_placed_distance,
+};
+use crate::tabs::typing::render_next::vector::{
+    Outline, OutlineCache, glyph_contour_from_outline, rasterize_outline_into,
+};
 use crate::tabs::typing::render_next::inline_styles::{
     InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
 };
@@ -41,12 +68,25 @@ use crate::tabs::typing::render_next::types::{
     TextVectorLineDistanceMode, TextVectorLineTextDirection,
 };
 use cosmic_text::{
-    Attrs, AttrsOwned, Buffer, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping, SwashCache,
-    SwashContent,
+    Attrs, AttrsOwned, Buffer, CacheKey, FontSystem, LayoutGlyph, LayoutRun, Metrics, Shaping,
+    SwashCache, SwashContent,
 };
 use std::collections::HashMap;
 
 const SOFT_HYPHEN: char = '\u{00AD}';
+
+/// Douglas-Peucker tolerance (glyph-local pixels) applied when simplifying a
+/// glyph's outline-derived contour. Small enough that the polygon still hugs the
+/// ink, large enough to keep the edge count (and the O(edges^2) distance test)
+/// low.
+const CONTOUR_SIMPLIFY_TOLERANCE_PX: f32 = 1.5;
+
+/// Minimum ink-to-ink whitespace (world pixels) enforced between adjacent
+/// glyphs in `MinimumPreviousDistance` mode. This is the tunable floor: the
+/// natural base gap (derived from advances vs. ink extents) is clamped up to
+/// this value so ink shapes never fully touch even where the base gap collapses
+/// to zero. Raise it to loosen spacing globally.
+const MIN_INK_GAP_FLOOR_PX: f32 = 0.5;
 
 #[derive(Debug)]
 pub(crate) enum FormulaRenderOutcome {
@@ -97,6 +137,10 @@ struct FormulaArcLengthSample {
     arc_len_px: f32,
 }
 
+/// On-path placement of a single glyph: the world center of the path point it
+/// sits on plus the glyph's total rotation (tangent/static + flip + per-glyph).
+/// The blit and the ink-contour placement both derive their world transform
+/// from this, guaranteeing they land on the same pixels.
 #[derive(Debug, Clone, Copy)]
 struct DrawnLineTransform {
     center_x: f32,
@@ -104,21 +148,53 @@ struct DrawnLineTransform {
     rotation_rad: f32,
 }
 
+/// Seed-aware wrapper over [`drawn_line_glyph_destination_center_raw`] that
+/// resolves the glyph baseline from the seed before computing the bitmap center.
 fn drawn_line_glyph_destination_center(
     seed: &FormulaGlyphSeed,
     transform: &DrawnLineTransform,
     scaled_top: f32,
     scaled_height: f32,
 ) -> (f32, f32) {
-    let scaled_center_y = scaled_top + scaled_height * 0.5;
     let baseline_y = seed.origin_y + seed.glyph_offset_px[1];
-    let local_x = 0.0;
+    drawn_line_glyph_destination_center_raw(transform, scaled_top, scaled_height, baseline_y)
+}
+
+/// World-space center of the glyph bitmap for a given on-path transform.
+///
+/// This is the single mapping the blit relies on: the glyph is drawn centered
+/// on the path point, shifted along the (rotated) vertical so the scaled bitmap
+/// center lands where the baseline requires. `baseline_y` is the glyph's layout
+/// baseline (`origin_y + vertical glyph offset`). The horizontal local offset is
+/// always zero, so only the rotated vertical term contributes. Kept free of
+/// `FormulaGlyphSeed` so the contour-placement path and unit tests can reuse it.
+fn drawn_line_glyph_destination_center_raw(
+    transform: &DrawnLineTransform,
+    scaled_top: f32,
+    scaled_height: f32,
+    baseline_y: f32,
+) -> (f32, f32) {
+    let scaled_center_y = scaled_top + scaled_height * 0.5;
     let local_y = scaled_center_y - baseline_y;
     let (sin_a, cos_a) = transform.rotation_rad.sin_cos();
     (
-        transform.center_x + local_x * cos_a - local_y * sin_a,
-        transform.center_y + local_x * sin_a + local_y * cos_a,
+        transform.center_x - local_y * sin_a,
+        transform.center_y + local_y * cos_a,
     )
+}
+
+/// Resolve a seed glyph's true font outline through the per-render cache.
+///
+/// Thin wrapper over [`resolve_outline_for_glyph`] keyed on the seed's glyph.
+/// Returns `None` when the font is missing or the glyph has no fillable
+/// monochrome outline (space or COLR/bitmap color glyph); callers then fall back
+/// to the bitmap blit.
+fn resolve_glyph_outline(
+    seed: &FormulaGlyphSeed,
+    font_system: &mut FontSystem,
+    outline_cache: &mut OutlineCache,
+) -> Option<std::sync::Arc<Outline>> {
+    resolve_outline_for_glyph(font_system, outline_cache, &seed.glyph)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,8 +205,7 @@ struct GlyphInkProfile {
 
 impl GlyphInkProfile {
     #[must_use]
-    fn fallback(width_px: f32, height_px: f32) -> Self {
-        let _ = height_px;
+    fn fallback(width_px: f32, _height_px: f32) -> Self {
         Self {
             left_px: 0.0,
             right_px: width_px.max(1.0),
@@ -330,9 +405,25 @@ fn render_text_with_drawn_lines_layout_once(
         ));
     }
 
-    let transforms = build_drawn_line_transforms(params, seeds.as_slice(), paths);
-    let skipped = transforms.iter().filter(|item| item.is_none()).count();
+    // The swash cache and the glyph-contour cache both live for the whole
+    // render so glyph rasterization and ink-contour tracing happen at most once
+    // per distinct glyph, and are reused by the bounds and composite passes.
     let mut cache = SwashCache::new();
+    let mut contour_cache: HashMap<CacheKey, CachedGlyphInk> = HashMap::new();
+    // Resolution-independent glyph outlines: shared by the ink-distance search
+    // (via the transforms below) and the composite pass so each glyph is
+    // extracted at most once per render.
+    let mut outline_cache = OutlineCache::new();
+    let transforms = build_drawn_line_transforms(
+        params,
+        seeds.as_slice(),
+        paths,
+        font_system,
+        &mut cache,
+        &mut contour_cache,
+        &mut outline_cache,
+    );
+    let skipped = transforms.iter().filter(|item| item.is_none()).count();
     let mut bounds = PixelBounds::empty();
     for (seed, transform) in seeds.iter().zip(transforms.iter()) {
         let Some(transform) = transform else {
@@ -443,8 +534,48 @@ fn render_text_with_drawn_lines_layout_once(
         if glyph_w == 0 || glyph_h == 0 {
             continue;
         }
+        let placement_left = image.placement.left as f32;
+        let placement_top = image.placement.top as f32;
         let src_left = (physical.x + image.placement.left) as f32;
         let src_top = (physical.y - image.placement.top) as f32;
+        let (_scaled_left, scaled_top, _scaled_width, scaled_height) =
+            seed.glyph_scale
+                .scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
+        let (dst_center_x, dst_center_y) =
+            drawn_line_glyph_destination_center(&seed, &transform, scaled_top, scaled_height);
+
+        // Prefer the true font outline: rasterize it directly into the output at
+        // the exact world placement the bitmap blit would have used. Color/emoji
+        // glyphs have no monochrome outline and keep the bitmap blit below.
+        if let Some(outline) = resolve_glyph_outline(&seed, font_system, &mut outline_cache) {
+            let glyph_transform = glyph_outline_transform(
+                dst_center_x,
+                dst_center_y,
+                transform.rotation_rad,
+                placement_left,
+                placement_top,
+                glyph_w as f32,
+                glyph_h as f32,
+                seed.glyph_scale.width_mul,
+                seed.glyph_scale.height_mul,
+                glyph_subpixel_offset(physical.cache_key),
+            );
+            rasterize_outline_into(
+                rgba.as_mut_slice(),
+                out_width as usize,
+                out_height as usize,
+                -(x_offset as f32),
+                -(y_offset as f32),
+                &outline,
+                &glyph_transform,
+                seed.text_color,
+            );
+            continue;
+        }
+
+        // Fallback: the original rotated bitmap blit for any outline-less glyph
+        // (real color glyph or a monochrome embedded-bitmap glyph). This path draws
+        // it regardless of color; the subpixel fraction is already in the bitmap.
         let src_center_x = src_left + glyph_w as f32 * 0.5;
         let src_center_y = src_top + glyph_h as f32 * 0.5;
         let cos_a = transform.rotation_rad.cos();
@@ -459,8 +590,6 @@ fn render_text_with_drawn_lines_layout_once(
         let (scaled_left, scaled_top, scaled_width, scaled_height) =
             seed.glyph_scale
                 .scaled_rect(src_left, src_top, glyph_w as f32, glyph_h as f32);
-        let (dst_center_x, dst_center_y) =
-            drawn_line_glyph_destination_center(&seed, &transform, scaled_top, scaled_height);
         let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
             scaled_left,
             scaled_top,
@@ -507,88 +636,444 @@ fn render_text_with_drawn_lines_layout_once(
     })
 }
 
+/// Compute the per-glyph on-path transforms for every seed of a custom line
+/// layout.
+///
+/// `font_system`/`cache`/`contour_cache`/`outline_cache` are only touched for
+/// lines that use `MinimumPreviousDistance` spacing, which needs the glyph's ink
+/// contour (derived from its outline); `ByLineLength` lines never extract here.
+/// The returned vector is index-aligned with `seeds`; `None` means the glyph
+/// could not be placed (past the end of its line path or missing sample) and is
+/// dropped by callers.
+// The placement context needs all four immutable/mutable dependencies; bundling
+// the three caches would not simplify the call site.
+#[allow(clippy::too_many_arguments)]
 fn build_drawn_line_transforms(
     params: &TextRenderParams,
     seeds: &[FormulaGlyphSeed],
     paths: &[Option<DrawnLinePath>],
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    contour_cache: &mut HashMap<CacheKey, CachedGlyphInk>,
+    outline_cache: &mut OutlineCache,
 ) -> Vec<Option<DrawnLineTransform>> {
     let mut line_offsets = HashMap::<usize, DrawnLinePlacementState>::new();
     let layout_settings = custom_line_layout_settings(params);
-    let letter_spacing_mul = layout_settings.letter_spacing_mul.clamp(0.0, 8.0);
-    let letter_spacing_px = layout_settings.letter_spacing_px.clamp(-10_000.0, 10_000.0);
-    let mut transforms = seeds
-        .iter()
-        .map(|seed| {
-            let path = paths.get(seed.line_idx).and_then(Option::as_ref)?;
-            let advance =
-                ((seed.advance_px.max(1.0) * letter_spacing_mul) + letter_spacing_px).max(1.0);
-            let state = line_offsets.entry(seed.line_idx).or_default();
-            let half_advance = advance * 0.5;
-            let mut center_s = state.offset_s_px + half_advance + seed.extended_offset.line_px;
-            if center_s > path.total_len_px {
-                return None;
-            }
-            if vector_line_distance_mode(params, seed.line_idx)
-                == TextVectorLineDistanceMode::MinimumPreviousDistance
-                && let Some((prev_x, prev_y)) = state.previous_center
-            {
-                let minimum_distance = state.previous_half_advance_px + half_advance;
-                center_s = find_minimum_distance_center_s(
-                    path,
-                    center_s,
-                    minimum_distance,
-                    prev_x,
-                    prev_y,
-                )?;
-            }
-            if center_s > path.total_len_px {
-                return None;
-            }
-            state.offset_s_px = center_s + half_advance - seed.extended_offset.line_px;
-            let (center_x, center_y, tangent_x, tangent_y) =
-                sample_drawn_line_path_for_direction(path, center_s)?;
-            let tangent_len = (tangent_x * tangent_x + tangent_y * tangent_y)
-                .sqrt()
-                .max(1e-6);
-            let tangent_x = tangent_x / tangent_len;
-            let tangent_y = tangent_y / tangent_len;
-            let normal_offset = layout_settings.normal_offset_px;
-            let center_x = center_x - tangent_y * normal_offset;
-            let center_y = center_y + tangent_x * normal_offset;
-            let rotation_rad = (if layout_settings.use_tangent_rotation {
-                tangent_y.atan2(tangent_x)
-            } else {
-                layout_settings.static_rotation_rad
-            }) + vector_line_flip_rotation(params, seed.line_idx)
-                + seed.extended_offset.glyph_rotation_rad;
-            let (sin_a, cos_a) = rotation_rad.sin_cos();
-            let center_x =
-                center_x + seed.glyph_offset_px[0] * cos_a - seed.glyph_offset_px[1] * sin_a;
-            let center_y =
-                center_y + seed.glyph_offset_px[0] * sin_a + seed.glyph_offset_px[1] * cos_a;
-            state.previous_center = Some((center_x, center_y));
-            state.previous_half_advance_px = half_advance;
-            if seed.extended_offset.shift_following
-                && is_last_seed_in_offset_span_on_line(seeds, seed)
-            {
-                state.offset_s_px += seed.extended_offset.line_px;
-            }
-            Some(DrawnLineTransform {
-                center_x,
-                center_y,
-                rotation_rad,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut ctx = DrawnLinePlacementCtx {
+        params,
+        seeds,
+        layout: layout_settings,
+        letter_spacing_mul: layout_settings.letter_spacing_mul.clamp(0.0, 8.0),
+        letter_spacing_px: layout_settings.letter_spacing_px.clamp(-10_000.0, 10_000.0),
+        font_system,
+        cache,
+        contour_cache,
+        outline_cache,
+    };
+    let mut transforms: Vec<Option<DrawnLineTransform>> = Vec::with_capacity(seeds.len());
+    for seed in seeds {
+        let Some(path) = paths.get(seed.line_idx).and_then(Option::as_ref) else {
+            transforms.push(None);
+            continue;
+        };
+        let state = line_offsets.entry(seed.line_idx).or_default();
+        transforms.push(drawn_line_seed_transform(&mut ctx, seed, path, state));
+    }
     apply_drawn_line_group_rotations(seeds, transforms.as_mut_slice());
     transforms
 }
 
+/// Stable placement context shared across all seeds of a custom line layout.
+///
+/// Bundles the immutable layout parameters with the mutable rasterization
+/// caches so per-seed placement helpers take a small argument list instead of a
+/// long positional one.
+struct DrawnLinePlacementCtx<'a> {
+    params: &'a TextRenderParams,
+    seeds: &'a [FormulaGlyphSeed],
+    layout: CustomLineLayoutSettings,
+    /// `letter_spacing_mul` clamped to the ByLineLength range.
+    letter_spacing_mul: f32,
+    /// `letter_spacing_px` clamped to the ByLineLength range.
+    letter_spacing_px: f32,
+    font_system: &'a mut FontSystem,
+    cache: &'a mut SwashCache,
+    contour_cache: &'a mut HashMap<CacheKey, CachedGlyphInk>,
+    outline_cache: &'a mut OutlineCache,
+}
+
+/// Place one glyph seed along its line path and advance the line's state.
+///
+/// For `ByLineLength` spacing this reproduces the original arc-length walk
+/// unchanged. For `MinimumPreviousDistance` it seeds the same arc-length
+/// position, then searches forward so the true minimum ink-to-ink distance to
+/// the previous glyph reaches the kerning-driven `target_gap`. Returns the
+/// blit-ready transform, or `None` when the glyph runs past the path end.
+fn drawn_line_seed_transform(
+    ctx: &mut DrawnLinePlacementCtx<'_>,
+    seed: &FormulaGlyphSeed,
+    path: &DrawnLinePath,
+    state: &mut DrawnLinePlacementState,
+) -> Option<DrawnLineTransform> {
+    let params = ctx.params;
+    let layout = ctx.layout;
+    let advance =
+        ((seed.advance_px.max(1.0) * ctx.letter_spacing_mul) + ctx.letter_spacing_px).max(1.0);
+    let half_advance = advance * 0.5;
+    // Arc-length seed: identical to ByLineLength placement.
+    let mut center_s = state.offset_s_px + half_advance + seed.extended_offset.line_px;
+    if center_s > path.total_len_px {
+        return None;
+    }
+
+    let use_ink = vector_line_distance_mode(params, seed.line_idx)
+        == TextVectorLineDistanceMode::MinimumPreviousDistance;
+    // Only the ink-distance mode needs the glyph's rasterized contour.
+    let geom = if use_ink {
+        seed_ink_geometry(
+            seed,
+            ctx.font_system,
+            ctx.cache,
+            ctx.contour_cache,
+            ctx.outline_cache,
+        )
+    } else {
+        None
+    };
+
+    if use_ink
+        && let (Some(prev), Some(g)) = (state.previous_contour.as_ref(), geom.as_ref())
+    {
+        // Natural base gap: the center-to-center arc advance (which already
+        // folds in letter-spacing via `advance` and kerning via `advance_px`)
+        // minus the two facing ink half-extents. Clamped up to the floor so the
+        // shapes never touch. Because kerning/letter-spacing are baked into
+        // `center_distance`, they tighten/loosen this gap without being
+        // re-applied (which would double-count them).
+        let this_ink_half = g.ink_width_px * seed.glyph_scale.width_mul * 0.5;
+        let center_distance = state.previous_half_advance_px + half_advance;
+        let target_gap = (center_distance - (state.previous_ink_half_px + this_ink_half))
+            .max(MIN_INK_GAP_FLOOR_PX);
+        center_s = find_minimum_ink_distance_center_s(path, center_s, target_gap, prev, |s| {
+            place_seed_contour_at(params, seed, g, path, s, &layout)
+        })?;
+    }
+
+    if center_s > path.total_len_px {
+        return None;
+    }
+    state.offset_s_px = center_s + half_advance - seed.extended_offset.line_px;
+    let transform = drawn_line_transform_at(params, seed, path, center_s, &layout)?;
+
+    if use_ink {
+        state.previous_half_advance_px = half_advance;
+        match geom.as_ref() {
+            Some(g) => {
+                // Store the current glyph placed at its FINAL center so the next
+                // glyph measures against the same contour the blit will draw.
+                let baseline_y = seed.origin_y + seed.glyph_offset_px[1];
+                state.previous_contour = Some(placed_contour_for_transform(
+                    &g.contour,
+                    g.placement_left,
+                    g.placement_top,
+                    g.glyph_w,
+                    g.glyph_h,
+                    seed.glyph_scale.width_mul,
+                    seed.glyph_scale.height_mul,
+                    g.scaled_top,
+                    g.scaled_height,
+                    baseline_y,
+                    g.subpixel,
+                    &transform,
+                ));
+                state.previous_ink_half_px = g.ink_width_px * seed.glyph_scale.width_mul * 0.5;
+            }
+            None => {
+                // Empty/space glyph (no ink): reset so the next glyph falls back
+                // to plain arc-length spacing instead of chaining a stale shape.
+                state.previous_contour = None;
+                state.previous_ink_half_px = 0.0;
+            }
+        }
+    }
+
+    if seed.extended_offset.shift_following && is_last_seed_in_offset_span_on_line(ctx.seeds, seed) {
+        state.offset_s_px += seed.extended_offset.line_px;
+    }
+    Some(transform)
+}
+
+/// On-path glyph placement state carried between seeds of one line.
+///
+/// `previous_contour` is the previous glyph's ink placed at its final center,
+/// used by `MinimumPreviousDistance` to measure the true ink-to-ink gap.
+/// `previous_half_advance_px` and `previous_ink_half_px` feed the natural base
+/// gap; all three are unused (and stay at their defaults) for `ByLineLength`.
 #[derive(Debug, Default)]
 struct DrawnLinePlacementState {
     offset_s_px: f32,
-    previous_center: Option<(f32, f32)>,
+    previous_contour: Option<PlacedContour>,
     previous_half_advance_px: f32,
+    /// World-space half-width of the previous glyph's ink (scaled by width_mul).
+    previous_ink_half_px: f32,
+}
+
+/// Cached ink data for one glyph key.
+///
+/// Keyed by the full cosmic-text [`CacheKey`] (subpixel bins included) so the
+/// cached data always matches the exact bitmap the blit references; the extra
+/// entries per glyph (one per subpixel bin actually used) are few and cheap.
+/// The contour lives in the outline's pen-relative y-down pixel frame; the
+/// bitmap `placement_left`/`placement_top` are stored so the contour can be
+/// placed with the same pivot the outline rasterizer uses.
+#[derive(Debug, Clone)]
+struct CachedGlyphInk {
+    /// Closed outer contour(s) of the glyph ink in the outline (pen-relative,
+    /// y-down px) frame, unscaled/unrotated.
+    contour: GlyphContour,
+    /// Glyph bitmap width in pixels.
+    glyph_w: f32,
+    /// Glyph bitmap height in pixels.
+    glyph_h: f32,
+    /// Bitmap x placement (pen-relative left edge).
+    placement_left: f32,
+    /// Bitmap y placement (pen-relative top above baseline).
+    placement_top: f32,
+    /// Horizontal ink extent (right - left) in glyph pixels.
+    ink_width_px: f32,
+}
+
+/// Per-seed ink geometry: the cached glyph contour plus the seed-specific
+/// scaled vertical placement needed to map the contour into world space.
+#[derive(Debug, Clone)]
+struct SeedInkGeometry {
+    /// Cached ink contour in the outline (pen-relative, y-down px) frame.
+    contour: GlyphContour,
+    /// Glyph bitmap width in pixels (pivot input).
+    glyph_w: f32,
+    /// Glyph bitmap height in pixels (pivot input).
+    glyph_h: f32,
+    /// Bitmap x placement (pen-relative left edge, pivot input).
+    placement_left: f32,
+    /// Bitmap y placement (pen-relative top above baseline, pivot input).
+    placement_top: f32,
+    /// Top of the scaled glyph rect in content coordinates (per seed scale).
+    scaled_top: f32,
+    /// Height of the scaled glyph rect in content coordinates.
+    scaled_height: f32,
+    /// Horizontal ink extent (right - left) in glyph pixels, used for the gap target.
+    ink_width_px: f32,
+    /// Subpixel fraction (`[x_bin, y_bin]`, device px) baked into the bitmap
+    /// coverage; folded into the outline pivot so the measured contour lands on
+    /// the same pixels as the drawn outline.
+    subpixel: [f32; 2],
+}
+
+/// Build (or reuse) the ink geometry for a seed's glyph.
+///
+/// The ink contour is derived from the glyph's true font outline (cached in
+/// `contour_cache` on a miss); the horizontal ink extent is still measured from
+/// the rasterized bitmap so the min-distance base gap matches the pixels drawn.
+/// Returns `None` for glyphs with no bitmap (e.g. spaces), zero-size placement,
+/// or no monochrome outline (color glyphs), which callers treat as "no ink" and
+/// handle with the arc-length fallback.
+fn seed_ink_geometry(
+    seed: &FormulaGlyphSeed,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    contour_cache: &mut HashMap<CacheKey, CachedGlyphInk>,
+    outline_cache: &mut OutlineCache,
+) -> Option<SeedInkGeometry> {
+    let physical = seed.glyph.physical(
+        (
+            seed.origin_x + seed.glyph_offset_px[0],
+            seed.origin_y + seed.glyph_offset_px[1],
+        ),
+        1.0,
+    );
+    let key = physical.cache_key;
+
+    // Bitmap placement + horizontal ink extent, copied out before the image
+    // borrow of `cache` ends.
+    let placement_left;
+    let placement_top;
+    let glyph_w;
+    let glyph_h;
+    let ink_width_px;
+    {
+        let Some(image) = cache.get_image(font_system, key) else {
+            return None;
+        };
+        let gw = image.placement.width as usize;
+        let gh = image.placement.height as usize;
+        if gw == 0 || gh == 0 {
+            return None;
+        }
+        placement_left = image.placement.left as f32;
+        placement_top = image.placement.top as f32;
+        glyph_w = gw as f32;
+        glyph_h = gh as f32;
+        let ink = glyph_ink_profile_from_image(
+            [
+                image.placement.left as f32,
+                (physical.y - image.placement.top) as f32,
+            ],
+            &image.content,
+            image.data.as_slice(),
+            [gw, gh],
+            [seed.glyph.w.max(1.0), 1.0],
+        );
+        ink_width_px = (ink.right_px - ink.left_px).max(0.0);
+    }
+
+    // Trace the ink contour from the true outline once per distinct glyph key.
+    // A glyph with no fillable monochrome outline is treated as "no ink".
+    if let std::collections::hash_map::Entry::Vacant(entry) = contour_cache.entry(key) {
+        let outline = resolve_glyph_outline(seed, font_system, outline_cache)?;
+        let contour = glyph_contour_from_outline(&outline, CONTOUR_SIMPLIFY_TOLERANCE_PX);
+        entry.insert(CachedGlyphInk {
+            contour,
+            glyph_w,
+            glyph_h,
+            placement_left,
+            placement_top,
+            ink_width_px,
+        });
+    }
+
+    let cached = contour_cache.get(&key)?;
+    let src_left = physical.x as f32 + placement_left;
+    let src_top = physical.y as f32 - placement_top;
+    let (_scaled_left, scaled_top, _scaled_width, scaled_height) =
+        seed.glyph_scale
+            .scaled_rect(src_left, src_top, glyph_w, glyph_h);
+    Some(SeedInkGeometry {
+        contour: cached.contour.clone(),
+        glyph_w: cached.glyph_w,
+        glyph_h: cached.glyph_h,
+        placement_left: cached.placement_left,
+        placement_top: cached.placement_top,
+        scaled_top,
+        scaled_height,
+        ink_width_px: cached.ink_width_px,
+        subpixel: glyph_subpixel_offset(key),
+    })
+}
+
+/// On-path transform (position + rotation) for a candidate arc-length position.
+///
+/// This is the single source of truth for glyph placement along a custom line:
+/// both the final blit transform and every trial contour placement during the
+/// ink-distance search go through it. Applies the normal offset, tangent/static
+/// rotation, flip, per-glyph rotation, and the rotated glyph offset exactly as
+/// the composite pass expects. Returns `None` if the path cannot be sampled.
+fn drawn_line_transform_at(
+    params: &TextRenderParams,
+    seed: &FormulaGlyphSeed,
+    path: &DrawnLinePath,
+    center_s: f32,
+    layout: &CustomLineLayoutSettings,
+) -> Option<DrawnLineTransform> {
+    let (center_x, center_y, tangent_x, tangent_y) =
+        sample_drawn_line_path_for_direction(path, center_s)?;
+    let tangent_len = (tangent_x * tangent_x + tangent_y * tangent_y)
+        .sqrt()
+        .max(1e-6);
+    let tangent_x = tangent_x / tangent_len;
+    let tangent_y = tangent_y / tangent_len;
+    let normal_offset = layout.normal_offset_px;
+    let center_x = center_x - tangent_y * normal_offset;
+    let center_y = center_y + tangent_x * normal_offset;
+    let rotation_rad = (if layout.use_tangent_rotation {
+        tangent_y.atan2(tangent_x)
+    } else {
+        layout.static_rotation_rad
+    }) + vector_line_flip_rotation(params, seed.line_idx)
+        + seed.extended_offset.glyph_rotation_rad;
+    let (sin_a, cos_a) = rotation_rad.sin_cos();
+    let center_x = center_x + seed.glyph_offset_px[0] * cos_a - seed.glyph_offset_px[1] * sin_a;
+    let center_y = center_y + seed.glyph_offset_px[0] * sin_a + seed.glyph_offset_px[1] * cos_a;
+    Some(DrawnLineTransform {
+        center_x,
+        center_y,
+        rotation_rad,
+    })
+}
+
+/// Place a glyph's cached contour into world space for a candidate position.
+///
+/// Combines [`drawn_line_transform_at`] with [`placed_contour_for_transform`]
+/// so the search closure produces the exact `PlacedContour` the blit would draw
+/// at `center_s`. Returns `None` when the path cannot be sampled.
+fn place_seed_contour_at(
+    params: &TextRenderParams,
+    seed: &FormulaGlyphSeed,
+    geom: &SeedInkGeometry,
+    path: &DrawnLinePath,
+    center_s: f32,
+    layout: &CustomLineLayoutSettings,
+) -> Option<PlacedContour> {
+    let transform = drawn_line_transform_at(params, seed, path, center_s, layout)?;
+    let baseline_y = seed.origin_y + seed.glyph_offset_px[1];
+    Some(placed_contour_for_transform(
+        &geom.contour,
+        geom.placement_left,
+        geom.placement_top,
+        geom.glyph_w,
+        geom.glyph_h,
+        seed.glyph_scale.width_mul,
+        seed.glyph_scale.height_mul,
+        geom.scaled_top,
+        geom.scaled_height,
+        baseline_y,
+        geom.subpixel,
+        &transform,
+    ))
+}
+
+/// Map an outline-frame contour into world space using the blit's exact
+/// geometry.
+///
+/// The contour lives in the outline's pen-relative y-down pixel frame (the same
+/// frame the outline rasterizer consumes), so this resolves the glyph's world
+/// destination center from the on-path transform and reuses
+/// [`glyph_outline_transform`] — the single source of truth for the pivot — so
+/// the measured contour lands on the exact pixels the outline is rasterized to.
+// The geometry is an irreducible list of independent scalars (bitmap
+// placement/size, per-axis scale, scaled vertical rect, baseline, transform);
+// bundling them into a one-off struct would not add clarity.
+#[allow(clippy::too_many_arguments)]
+fn placed_contour_for_transform(
+    contour: &GlyphContour,
+    placement_left: f32,
+    placement_top: f32,
+    glyph_w: f32,
+    glyph_h: f32,
+    width_mul: f32,
+    height_mul: f32,
+    scaled_top: f32,
+    scaled_height: f32,
+    baseline_y: f32,
+    subpixel: [f32; 2],
+    transform: &DrawnLineTransform,
+) -> PlacedContour {
+    let (dst_center_x, dst_center_y) =
+        drawn_line_glyph_destination_center_raw(transform, scaled_top, scaled_height, baseline_y);
+    // Same subpixel-corrected pivot the outline rasterizer uses, so the measured
+    // contour matches the drawn ink exactly.
+    let glyph_transform = glyph_outline_transform(
+        dst_center_x,
+        dst_center_y,
+        transform.rotation_rad,
+        placement_left,
+        placement_top,
+        glyph_w,
+        glyph_h,
+        width_mul,
+        height_mul,
+        subpixel,
+    );
+    glyph_transform.place_contour(contour)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -864,34 +1349,49 @@ fn line_path_forward_for_direction(path: &DrawnLinePath) -> bool {
     }
 }
 
-fn distance_between_points(a_x: f32, a_y: f32, b_x: f32, b_y: f32) -> f32 {
-    let dx = b_x - a_x;
-    let dy = b_y - a_y;
-    (dx * dx + dy * dy).sqrt()
-}
-
-fn find_minimum_distance_center_s(
+/// Find the smallest `center_s >= start_s` whose placed contour clears the
+/// previous glyph's ink by at least `target_gap`.
+///
+/// `current_at(s)` must return the current glyph's `PlacedContour` at candidate
+/// arc-length `s` (or `None` when `s` cannot be sampled). The predicate is
+/// `min_placed_distance(prev_placed, current) >= target_gap`; note that
+/// `min_placed_distance` yields `0.0` on overlap (so a concave inner corner is
+/// correctly pushed forward) and `f32::INFINITY` when either contour is empty
+/// (so an empty previous or current glyph satisfies the predicate immediately
+/// and falls back to the plain arc-length seed).
+///
+/// Robust structure: early-out if the seed already clears the gap; otherwise a
+/// coarse forward scan brackets the first passing position, refined by fixed
+/// bisection. Returns `None` if no position up to the path end satisfies the
+/// gap, so the glyph is dropped like the arc-length walk would drop it.
+fn find_minimum_ink_distance_center_s<F>(
     path: &DrawnLinePath,
     start_s: f32,
-    minimum_distance: f32,
-    prev_x: f32,
-    prev_y: f32,
-) -> Option<f32> {
-    let start_sample = sample_drawn_line_path_for_direction(path, start_s)?;
-    if distance_between_points(prev_x, prev_y, start_sample.0, start_sample.1) >= minimum_distance {
+    target_gap: f32,
+    prev_placed: &PlacedContour,
+    mut current_at: F,
+) -> Option<f32>
+where
+    F: FnMut(f32) -> Option<PlacedContour>,
+{
+    let clears = |placed: &PlacedContour| min_placed_distance(prev_placed, placed) >= target_gap;
+
+    if clears(&current_at(start_s)?) {
         return Some(start_s);
     }
 
-    let scan_step = (minimum_distance / 8.0).clamp(0.5, 4.0);
+    // Step size scales with the target so wide gaps scan coarsely and tight
+    // gaps finely; clamped to keep the scan bounded on any path length.
+    let scan_step = (target_gap.max(1.0) / 8.0).clamp(0.5, 4.0);
     let mut low = start_s;
     let mut high = (start_s + scan_step).min(path.total_len_px);
-    while high <= path.total_len_px {
-        let sample = sample_drawn_line_path_for_direction(path, high)?;
-        if distance_between_points(prev_x, prev_y, sample.0, sample.1) >= minimum_distance {
+    loop {
+        if clears(&current_at(high)?) {
             break;
         }
         if high >= path.total_len_px {
-            return Some(path.total_len_px + minimum_distance);
+            // Ran off the end without ever clearing the gap: drop the glyph.
+            return None;
         }
         low = high;
         high = (high + scan_step).min(path.total_len_px);
@@ -899,8 +1399,7 @@ fn find_minimum_distance_center_s(
 
     for _ in 0..18 {
         let mid = low + (high - low) * 0.5;
-        let sample = sample_drawn_line_path_for_direction(path, mid)?;
-        if distance_between_points(prev_x, prev_y, sample.0, sample.1) >= minimum_distance {
+        if clears(&current_at(mid)?) {
             high = mid;
         } else {
             low = mid;
@@ -957,6 +1456,9 @@ fn render_text_with_formula_layout_once(
     let width_px = params.width_px.max(1);
     let formula_program = FormulaProgramBundle::compile(&params.formula_layout)?;
     let mut cache = SwashCache::new();
+    // Per-render outline cache for the vector composite pass (color glyphs fall
+    // back to the bitmap blit, so they are never extracted here).
+    let mut outline_cache = OutlineCache::new();
     let has_inline_size_overrides =
         inline_style_spans.is_some_and(spans_have_inline_size_overrides);
     let default_extra_line_spacing_px = line_extra_spacing_table.first().copied().unwrap_or(0.0);
@@ -1144,8 +1646,43 @@ fn render_text_with_formula_layout_once(
         if glyph_w == 0 || glyph_h == 0 {
             continue;
         }
+        let placement_left = image.placement.left as f32;
+        let placement_top = image.placement.top as f32;
         let src_left = (physical.x + image.placement.left) as f32;
         let src_top = (physical.y - image.placement.top) as f32;
+
+        // Prefer the true font outline; keep the bitmap blit for outline-less
+        // glyphs. The formula transform's center is the glyph bitmap center in
+        // world space, so it is the outline destination center directly.
+        if let Some(outline) = resolve_glyph_outline(&seed, font_system, &mut outline_cache) {
+            let glyph_transform = glyph_outline_transform(
+                transform.center_x,
+                transform.center_y,
+                transform.rotation_rad,
+                placement_left,
+                placement_top,
+                glyph_w as f32,
+                glyph_h as f32,
+                seed.glyph_scale.width_mul,
+                seed.glyph_scale.height_mul,
+                glyph_subpixel_offset(physical.cache_key),
+            );
+            rasterize_outline_into(
+                rgba.as_mut_slice(),
+                out_width as usize,
+                out_height as usize,
+                -(x_offset as f32),
+                -(y_offset as f32),
+                &outline,
+                &glyph_transform,
+                seed.text_color,
+            );
+            continue;
+        }
+
+        // Fallback: the original rotated bitmap blit for any outline-less glyph
+        // (real color glyph or a monochrome embedded-bitmap glyph). The subpixel
+        // fraction is already baked into the bitmap coverage.
         let src_center_x = src_left + glyph_w as f32 * 0.5;
         let src_center_y = src_top + glyph_h as f32 * 0.5;
         let cos_a = transform.rotation_rad.cos();
@@ -2163,13 +2700,33 @@ fn glyph_ink_profile_from_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{distance_between_points, find_minimum_distance_center_s};
+    use super::{
+        DrawnLineTransform, drawn_line_glyph_destination_center_raw,
+        find_minimum_ink_distance_center_s, placed_contour_for_transform,
+        sample_drawn_line_path_for_direction,
+    };
     use crate::tabs::typing::render_next::drawn_lines::{DrawnLinePath, DrawnLinePoint};
+    use crate::tabs::typing::render_next::glyph_contour::{
+        GlyphContour, PlacedContour, min_placed_distance,
+    };
+    use crate::tabs::typing::render_next::raster::rotated_rect_world_bounds;
     use crate::tabs::typing::render_next::types::TextVectorLineTextDirection;
 
-    #[test]
-    fn minimum_distance_search_places_next_center_at_threshold() {
-        let path = DrawnLinePath {
+    /// Axis-aligned square contour of side `2 * half` centered on the origin.
+    fn square_contour(half: f32) -> GlyphContour {
+        GlyphContour {
+            components: vec![vec![
+                [-half, -half],
+                [half, -half],
+                [half, half],
+                [-half, half],
+            ]],
+        }
+    }
+
+    /// A straight horizontal path along +x of the given length.
+    fn straight_path(len: f32) -> DrawnLinePath {
+        DrawnLinePath {
             points: vec![
                 DrawnLinePoint {
                     x: 0.0,
@@ -2177,23 +2734,209 @@ mod tests {
                     arc_len_px: 0.0,
                 },
                 DrawnLinePoint {
-                    x: 200.0,
+                    x: len,
                     y: 0.0,
-                    arc_len_px: 200.0,
+                    arc_len_px: len,
                 },
             ],
-            total_len_px: 200.0,
+            total_len_px: len,
             direction: TextVectorLineTextDirection::LeftToRight,
-            honor_text_direction: true,
+            honor_text_direction: false,
+        }
+    }
+
+    /// A semicircle path of radius `r`, sampled into `segments` chords, so the
+    /// chord distance between two arc-length-equidistant points is always less
+    /// than their arc-length separation (any curve pulls shapes together).
+    fn semicircle_path(r: f32, segments: usize) -> DrawnLinePath {
+        let mut points = Vec::with_capacity(segments + 1);
+        let mut arc = 0.0f32;
+        let mut prev: Option<(f32, f32)> = None;
+        for i in 0..=segments {
+            let angle = std::f32::consts::PI * (i as f32) / (segments as f32);
+            let x = r * angle.cos();
+            let y = r * angle.sin();
+            if let Some((px, py)) = prev {
+                arc += ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+            }
+            points.push(DrawnLinePoint {
+                x,
+                y,
+                arc_len_px: arc,
+            });
+            prev = Some((x, y));
+        }
+        DrawnLinePath {
+            points,
+            total_len_px: arc,
+            direction: TextVectorLineTextDirection::LeftToRight,
+            honor_text_direction: false,
+        }
+    }
+
+    /// Place a square contour (identity rotation/scale) at the path sample for
+    /// arc-length `s`.
+    fn square_at(path: &DrawnLinePath, contour: &GlyphContour, s: f32) -> Option<PlacedContour> {
+        let (x, y, _tx, _ty) = sample_drawn_line_path_for_direction(path, s)?;
+        Some(contour.placed(1.0, 0.0, 1.0, 1.0, x, y))
+    }
+
+    #[test]
+    fn straight_line_keeps_arc_length_seed_when_gap_already_clears() {
+        // Two width-10 squares (half extent 5). On a straight line the ink gap
+        // at center distance d is d - 10. Seed at 20 already gives gap 10 >= 6,
+        // so the search must return the seed unchanged (straight text intact).
+        let path = straight_path(200.0);
+        let contour = square_contour(5.0);
+        let prev = contour.placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let seed = 20.0f32;
+        let target_gap = 6.0f32;
+
+        let result = find_minimum_ink_distance_center_s(&path, seed, target_gap, &prev, |s| {
+            square_at(&path, &contour, s)
+        })
+        .expect("straight path should place the glyph");
+
+        assert!((result - seed).abs() < 1e-4, "result={result}");
+        let placed = square_at(&path, &contour, result).expect("sample");
+        assert!(
+            min_placed_distance(&prev, &placed) >= target_gap,
+            "gap not met"
+        );
+    }
+
+    #[test]
+    fn straight_line_pushes_forward_minimally_to_reach_gap() {
+        // Seed at 12 gives gap 2 < 6; the search should push to ~16 (gap 6).
+        let path = straight_path(200.0);
+        let contour = square_contour(5.0);
+        let prev = contour.placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let target_gap = 6.0f32;
+
+        let result = find_minimum_ink_distance_center_s(&path, 12.0, target_gap, &prev, |s| {
+            square_at(&path, &contour, s)
+        })
+        .expect("straight path should place the glyph");
+
+        assert!((result - 16.0).abs() <= 0.2, "result={result}");
+        let placed = square_at(&path, &contour, result).expect("sample");
+        assert!(min_placed_distance(&prev, &placed) >= target_gap);
+    }
+
+    #[test]
+    fn curved_path_pushes_center_forward_past_overlap() {
+        // On a semicircle, placing the current square at the arc-length seed
+        // overlaps the previous one (chord < arc). The search must push the
+        // center forward until the ink gap is cleared.
+        let path = semicircle_path(50.0, 96);
+        let contour = square_contour(5.0);
+        let prev = square_at(&path, &contour, 0.0).expect("prev sample");
+        let seed = 6.0f32;
+        let target_gap = 4.0f32;
+
+        // Confirm the seed really overlaps (distance 0) so the test is meaningful.
+        let seed_placed = square_at(&path, &contour, seed).expect("seed sample");
+        assert_eq!(min_placed_distance(&prev, &seed_placed), 0.0);
+
+        let result = find_minimum_ink_distance_center_s(&path, seed, target_gap, &prev, |s| {
+            square_at(&path, &contour, s)
+        })
+        .expect("semicircle should have room");
+
+        assert!(result > seed, "result={result} should exceed seed={seed}");
+        let placed = square_at(&path, &contour, result).expect("sample");
+        assert!(
+            min_placed_distance(&prev, &placed) >= target_gap,
+            "gap not met at result={result}"
+        );
+    }
+
+    #[test]
+    fn empty_current_contour_falls_back_to_arc_length_seed() {
+        // A space glyph has no ink: min distance is INFINITY, so the predicate
+        // holds at the seed and the search returns it without looping.
+        let path = straight_path(200.0);
+        let prev = square_contour(5.0).placed(1.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+        let empty = PlacedContour::default();
+        let seed = 25.0f32;
+
+        let result = find_minimum_ink_distance_center_s(&path, seed, 6.0, &prev, |_s| {
+            Some(empty.clone())
+        })
+        .expect("empty contour should place at the seed");
+        assert!((result - seed).abs() < 1e-6, "result={result}");
+    }
+
+    #[test]
+    fn placed_contour_stays_within_composited_world_rect() {
+        // A contour spanning the glyph outline bbox must land inside the same
+        // rotated, scaled world rect the blit draws into. This guards the
+        // pivot/translation math in placed_contour_for_transform, which now
+        // works in the outline (pen-relative, y-down px) frame.
+        let glyph_w = 10.0f32;
+        let glyph_h = 8.0f32;
+        let width_mul = 1.5f32;
+        let height_mul = 1.5f32;
+        // With placement (0, 0), the outline bbox spans [0, glyph_w] x
+        // [0, glyph_h] and its center is the bitmap center (glyph_w/2, glyph_h/2).
+        let placement_left = 0.0f32;
+        let placement_top = 0.0f32;
+        let contour = GlyphContour {
+            components: vec![vec![
+                [0.0, 0.0],
+                [glyph_w, 0.0],
+                [glyph_w, glyph_h],
+                [0.0, glyph_h],
+            ]],
         };
 
-        let next_s = match find_minimum_distance_center_s(&path, 30.0, 42.0, 0.0, 0.0) {
-            Some(value) => value,
-            None => panic!("straight path should have enough room"),
-        };
-        let actual = distance_between_points(0.0, 0.0, next_s, 0.0);
+        // Scaled rect for src at origin, mirroring GlyphScaleSettings::scaled_rect.
+        let scaled_width = glyph_w * width_mul;
+        let scaled_height = glyph_h * height_mul;
+        let scaled_left = glyph_w * 0.5 - scaled_width * 0.5;
+        let scaled_top = glyph_h * 0.5 - scaled_height * 0.5;
+        let baseline_y = 3.0f32;
 
-        assert!((next_s - 42.0).abs() <= 0.02, "next_s={next_s}");
-        assert!(actual >= 41.98, "actual={actual}");
+        let transform = DrawnLineTransform {
+            center_x: 40.0,
+            center_y: 25.0,
+            rotation_rad: 0.7,
+        };
+        let (dst_cx, dst_cy) = drawn_line_glyph_destination_center_raw(
+            &transform,
+            scaled_top,
+            scaled_height,
+            baseline_y,
+        );
+        let (min_x, min_y, max_x, max_y) = rotated_rect_world_bounds(
+            scaled_left,
+            scaled_top,
+            scaled_width,
+            scaled_height,
+            dst_cx,
+            dst_cy,
+            transform.rotation_rad,
+        );
+
+        let placed = placed_contour_for_transform(
+            &contour,
+            placement_left,
+            placement_top,
+            glyph_w,
+            glyph_h,
+            width_mul,
+            height_mul,
+            scaled_top,
+            scaled_height,
+            baseline_y,
+            [0.0, 0.0],
+            &transform,
+        );
+
+        let eps = 0.01f32;
+        assert!(placed.aabb_min[0] >= min_x - eps, "min_x");
+        assert!(placed.aabb_min[1] >= min_y - eps, "min_y");
+        assert!(placed.aabb_max[0] <= max_x + eps, "max_x");
+        assert!(placed.aabb_max[1] <= max_y + eps, "max_y");
     }
 }

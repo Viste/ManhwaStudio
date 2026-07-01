@@ -9,17 +9,26 @@ has prepared vertical layout text.
 `layout::vertical` receives shaped `cosmic-text` runs, inline style spans, line offset
 tables, and render parameters from `pipeline.rs`. It converts vertical layout text into
 columns and cells, computes visual column positions and optical vertical spacing, then
-draws glyph RGBA buffers through the shared `raster.rs` helpers.
+draws each glyph by rasterizing its true font outline (shared `glyph_blit` helpers +
+`vector::rasterize_outline_into`), mirroring the horizontal and on-path render paths.
+COLR/bitmap color glyphs with no monochrome outline fall back to the `raster.rs` bitmap
+blit.
+
+Layout is swash-bitmap based: column widths, cell baselines, optical profiles, glyph
+visual-width measurement, and the output-bounds pass all use `cache.get_image` placement.
+Only the final per-glyph draw switched from a bitmap blit to the vector rasterizer, so the
+geometry (and the golden output) stays identical apart from anti-aliasing.
 
 Wrapping decisions are upstream in `wrap/`; this module should position and draw the
-already prepared layout text. Low-level pixel blending, glyph alpha sampling, and bounds
-trimming remain in `raster.rs`.
+already prepared layout text. Low-level pixel blending, glyph alpha sampling, bounds
+trimming, and the color-glyph bitmap blit remain in `raster.rs`.
 
 ## Files and submodules
 - `mod.rs`: private module wiring and re-export of `VerticalRasterRequest` and
   `render_vertical_text`.
 - `vertical.rs`: vertical column/cell collection, optical pair spacing, column direction
-  handling, inline glyph overrides, glyph rasterization, and final RGBA assembly.
+  handling, inline glyph overrides, outline-based glyph rasterization (with color-glyph
+  bitmap fallback), and final RGBA assembly.
 
 ## Contracts and invariants
 - Inputs must come through `VerticalRasterRequest`; do not access typing panel, project,

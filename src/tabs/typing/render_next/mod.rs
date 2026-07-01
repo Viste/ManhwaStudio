@@ -23,11 +23,14 @@ pub(crate) mod drawn_lines;
 mod effects;
 mod font_registry;
 mod formula;
+mod glyph_blit;
+mod glyph_contour;
 mod inline_styles;
 mod layout;
 pub mod pipeline;
 mod raster;
 pub mod types;
+mod vector;
 mod wrap;
 
 // Общая логика дискретных форм текста живёт в подсистеме wrap и используется
@@ -87,6 +90,44 @@ pub use pipeline::apply_effects_to_image;
 const _: fn(&str, forms::TextFormPreset, usize) -> Option<Vec<String>> = forms::choose_form;
 const _: fn(&[u32], forms::TextFormPreset, u32) -> bool = forms::sequence_matches;
 const _: fn(&[u32], u32) -> bool = forms::is_christmas_tree;
+
+// Anchor: glyph ink-boundary geometry used by the on-path minimum-distance
+// spacing engine. The contour itself now comes from `vector::glyph_contour_from_outline`;
+// these entries keep the placement/distance contract compiled.
+const _: fn(&glyph_contour::GlyphContour, f32, f32, f32, f32, f32, f32) -> glyph_contour::PlacedContour =
+    glyph_contour::GlyphContour::placed;
+const _: fn(&glyph_contour::GlyphContour) -> bool = glyph_contour::GlyphContour::is_empty;
+const _: fn(&glyph_contour::PlacedContour, &glyph_contour::PlacedContour) -> f32 =
+    glyph_contour::min_placed_distance;
+
+// Anchor: foundational vector-glyph layer (outline extraction, cache, single
+// zeno rasterizer, and Outline->GlyphContour). Now the active monochrome draw
+// path for all three modes (horizontal/vertical/on-path/formula); these entries
+// keep the full vector API surface compiled even where only a subset is reached
+// at runtime. See `vector.rs` and `VECTOR_ENGINE_REFACTOR.md`.
+const _: fn(&swash::FontRef, u16, f32) -> Option<vector::Outline> = vector::extract_glyph_outline;
+#[allow(clippy::type_complexity)]
+const _: fn(&mut [u8], usize, usize, f32, f32, &vector::Outline, &vector::GlyphTransform, [u8; 4]) =
+    vector::rasterize_outline_into;
+const _: fn(&vector::Outline, f32) -> glyph_contour::GlyphContour =
+    vector::glyph_contour_from_outline;
+const _: fn() -> vector::OutlineCache = vector::OutlineCache::new;
+const _: fn(
+    &mut vector::OutlineCache,
+    vector::OutlineKey,
+    &swash::FontRef,
+    u16,
+    f32,
+) -> Option<std::sync::Arc<vector::Outline>> = vector::OutlineCache::get_or_extract;
+const _: fn(&vector::OutlineCache) -> usize = vector::OutlineCache::len;
+const _: fn(u64, u16, f32) -> vector::OutlineKey = vector::OutlineKey::new;
+const _: fn() -> vector::GlyphTransform = vector::GlyphTransform::identity;
+const _: fn(&vector::GlyphTransform, &glyph_contour::GlyphContour) -> glyph_contour::PlacedContour =
+    vector::GlyphTransform::place_contour;
+const _: fn(&vector::Outline) -> ([f32; 2], [f32; 2]) = vector::Outline::local_bbox;
+const _: fn(&vector::Outline) -> &[Vec<[f32; 2]>] = vector::Outline::subpaths;
+const _: fn(&vector::Outline) -> vector::FillRule = vector::Outline::winding;
+const _: [vector::FillRule; 2] = [vector::FillRule::NonZero, vector::FillRule::EvenOdd];
 
 pub(crate) fn touch_runtime_smoke_contract() {
     formula::touch_formula_smoke_contract();

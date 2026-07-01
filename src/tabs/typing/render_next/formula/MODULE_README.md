@@ -28,7 +28,15 @@ the line paths.
 - `eval.rs`: compiled formula bundle, runtime variable lookup, finite-value checks,
   transform evaluation, tangent rotation, and arc-length table generation.
 - `render.rs`: formula/custom-line render requests, glyph seed collection, advance
-  assignment, line-path mapping, rotated glyph bounds/drawing, and fallback decisions.
+  assignment, line-path mapping, glyph bounds, and fallback decisions. Its composite
+  pass rasterizes each glyph's true font outline (`render_next/vector.rs`) via
+  `glyph_outline_transform` + `rasterize_outline_into`; color glyphs (no monochrome
+  outline) keep the legacy rotated bitmap blit. For `CustomVectorLines` lines set to
+  `MinimumPreviousDistance`, it derives each glyph's ink contour from that outline
+  (`vector::glyph_contour_from_outline` -> `render_next/glyph_contour.rs`, cached by
+  cosmic-text `CacheKey`) and searches the arc-length position so the true ink-to-ink
+  gap to the previous glyph reaches a kerning-driven target, instead of center-to-center
+  distance.
 
 ## Contracts and invariants
 - Formula input comes from `TextFormulaLayoutParams`; do not read panel state,
@@ -45,6 +53,11 @@ the line paths.
   that cannot use a curve safely. Do not silently render a different mode.
 - Rotated raster output must keep `RenderedTextImage.rgba` in unmultiplied RGBA order
   with a valid `width * height * 4` buffer.
+- The on-path glyph transform has a single source of truth (`drawn_line_transform_at` +
+  `drawn_line_glyph_destination_center_raw`). The outline rasterizer, the ink-distance
+  search, and `placed_contour_for_transform` all build the outline->world placement with
+  the same `glyph_outline_transform` pivot, so a measured contour lands on exactly the
+  pixels the glyph is rasterized to (zero shift versus the old bitmap placement).
 
 ## Editing map
 - To add formula syntax, edit `parser.rs`, then update `eval.rs` if the new syntax
