@@ -785,7 +785,7 @@ impl CanvasHooks for TypingHooks<'_> {
         self.top_panel.draw(
             ctx,
             canvas_rect,
-            &mut self.text_overlays,
+            self.text_overlays,
             canvas.current_page_idx(),
             layout_editor_active,
         );
@@ -1405,6 +1405,11 @@ struct TypingOverlayDragState {
 
 type TypingOverlayLoadResponse = (PathBuf, Result<Vec<TypingOverlayDecoded>, String>);
 
+/// Eager-migration request payload captured at chapter open:
+/// `(committed_layers_dir, legacy_text_images_dir, unsaved_layers_dir, page_paths)`,
+/// where `page_paths` is a list of `(page_idx, page_path)`.
+type PendingMigrationRequest = (PathBuf, PathBuf, PathBuf, Vec<(usize, PathBuf)>);
+
 pub(super) struct TypingTextOverlayLayer {
     loaded_project_dir: Option<PathBuf>,
     loaded_text_images_dir: Option<PathBuf>,
@@ -1509,7 +1514,7 @@ pub(super) struct TypingTextOverlayLayer {
     /// Pending eager-migration request captured at chapter open; the worker is only STARTED once the
     /// initial overlay load completes, so it does not race the loader on the overlay PNGs it renames.
     /// `(committed_layers_dir, legacy_text_images_dir, unsaved_layers_dir, page_paths)`.
-    pending_migration: Option<(PathBuf, PathBuf, PathBuf, Vec<(usize, PathBuf)>)>,
+    pending_migration: Option<PendingMigrationRequest>,
     /// User-chosen WIDTH (px) of the floating "Слои страницы" panel, persisted across frames/pages.
     /// Clamped to `>= LAYERS_PANEL_MIN_WIDTH` (the width at which a text preview shows exactly 5 chars).
     /// Wider → text rows show more preview chars before the trailing dots (min 5).

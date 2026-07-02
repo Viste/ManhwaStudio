@@ -650,7 +650,6 @@ impl TypingTextOverlayLayer {
 /// в редакторе, и для композиции при экспорте, чтобы UI и PNG/PSD совпадали.
 // `overlay_stack_cmp` (the old layer_idx + page-Y auto-order) was retired: text is now ordered by the
 // unified manual band-Z everywhere (draw, interaction, export), like rasters.
-
 pub(in crate::tabs::typing) fn flatten_typing_export_page_rgba(
     job: &TypingExportPageJob,
 ) -> Result<(Vec<u8>, usize, usize), String> {

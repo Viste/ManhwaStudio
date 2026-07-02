@@ -99,28 +99,37 @@ pub(super) fn wheel_steps_if_hovered(ui: &egui::Ui, response: &egui::Response) -
     None
 }
 
+/// Конфигурация строки `px_or_percent_param_row`: диапазон слайдера, шаг колеса и размер
+/// шрифта, через который пересчитываются пиксели ↔ проценты.
+pub(super) struct PxOrPercentRowCfg {
+    /// Допустимый диапазон значения (в текущей единице строки).
+    pub(super) range: std::ops::RangeInclusive<f32>,
+    /// Шаг изменения значения колесом мыши.
+    pub(super) wheel_step: f32,
+    /// Размер шрифта в px, используемый для конверсии px ↔ % от кегля.
+    pub(super) font_size_px: f32,
+}
+
 /// Строка параметра «значение + переключатель X / X%» (пиксели или проценты от кегля).
 ///
-/// При переключении единицы значение пересчитывается через `font_size_px`, чтобы
+/// При переключении единицы значение пересчитывается через `cfg.font_size_px`, чтобы
 /// итоговый результат остался максимально близким (px ↔ % от размера шрифта).
 pub(super) fn px_or_percent_param_row(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut PxOrPercent,
-    range: std::ops::RangeInclusive<f32>,
-    wheel_step: f32,
-    font_size_px: f32,
+    cfg: PxOrPercentRowCfg,
     changed: &mut bool,
     block_hscroll_by_hovered_param: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        let min = *range.start();
-        let max = *range.end();
-        let slider_resp = ui.add(WheelSlider::new(&mut value.value, range).text(label));
+        let min = *cfg.range.start();
+        let max = *cfg.range.end();
+        let slider_resp = ui.add(WheelSlider::new(&mut value.value, cfg.range).text(label));
         mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &slider_resp);
         *changed |= slider_resp.changed();
         if let Some(steps) = wheel_steps_if_hovered(ui, &slider_resp) {
-            *changed |= apply_wheel_step_f32(&mut value.value, steps, wheel_step, min, max);
+            *changed |= apply_wheel_step_f32(&mut value.value, steps, cfg.wheel_step, min, max);
         }
         let mut want_percent = value.is_percent;
         egui::Frame::group(ui.style())
@@ -145,9 +154,9 @@ pub(super) fn px_or_percent_param_row(
         if want_percent != value.is_percent {
             // Подбираем значение в новой единице с наиболее близким результатом.
             let converted = if want_percent {
-                value.as_percent_of(font_size_px)
+                value.as_percent_of(cfg.font_size_px)
             } else {
-                value.as_px_of(font_size_px)
+                value.as_px_of(cfg.font_size_px)
             };
             value.value = converted.clamp(min, max);
             value.is_percent = want_percent;

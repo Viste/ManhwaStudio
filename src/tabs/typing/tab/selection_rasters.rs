@@ -129,17 +129,17 @@ impl TypingTextOverlayLayer {
             .get(overlay_idx)
             .filter(|o| o.kind == TypingOverlayKind::Text)
             .map(|o| (o.page_idx, o.uid.clone()));
-        if crate::trace::trace_enabled() {
-            if let Some(o) = self.overlays.get(overlay_idx) {
-                crate::trace_log!(
-                    cat::TYPING,
-                    "remove_overlay idx={} uid={} kind={:?} page={}",
-                    overlay_idx,
-                    o.uid,
-                    o.kind,
-                    o.page_idx
-                );
-            }
+        if crate::trace::trace_enabled()
+            && let Some(o) = self.overlays.get(overlay_idx)
+        {
+            crate::trace_log!(
+                cat::TYPING,
+                "remove_overlay idx={} uid={} kind={:?} page={}",
+                overlay_idx,
+                o.uid,
+                o.kind,
+                o.page_idx
+            );
         }
         self.overlays.remove(overlay_idx);
         self.shape_variant_preview = None;
@@ -217,10 +217,10 @@ impl TypingTextOverlayLayer {
             doc.remove_node(page_idx, &uid);
         });
         // Remove the cached projection (its `texture` handle is freed on drop).
-        if let Some(layers) = self.raster_layers_by_page.get_mut(&page_idx) {
-            if raster_idx < layers.len() {
-                layers.remove(raster_idx);
-            }
+        if let Some(layers) = self.raster_layers_by_page.get_mut(&page_idx)
+            && raster_idx < layers.len()
+        {
+            layers.remove(raster_idx);
         }
         self.raster_texture_generations
             .retain(|(p, u), _| !(*p == page_idx && *u == uid));
@@ -1116,22 +1116,21 @@ impl TypingTextOverlayLayer {
             self.raster_drag_state = None;
             self.raster_drag_has_changes = false;
         }
-        if let Some(idx) = toggle_mask_clip {
-            if let Some(layer) = self
+        if let Some(idx) = toggle_mask_clip
+            && let Some(layer) = self
                 .raster_layers_by_page
                 .get(&page_idx)
                 .and_then(|v| v.get(idx))
-            {
-                let uid = layer.uid.clone();
-                let new_val = !layer.mask_clip_enabled;
-                // Route through the doc (source of truth): bumps generation → re-clip + re-upload, and
-                // bumps the doc version → the PS tab re-projects.
-                self.route_to_doc(page_idx, |doc| {
-                    doc.set_raster_mask_clip(page_idx, &uid, Some(new_val));
-                });
-                // Persist so it survives a reload / save-to-project (whole-page raster save preserves it).
-                self.persist_current_page_rasters(page_idx);
-            }
+        {
+            let uid = layer.uid.clone();
+            let new_val = !layer.mask_clip_enabled;
+            // Route through the doc (source of truth): bumps generation → re-clip + re-upload, and
+            // bumps the doc version → the PS tab re-projects.
+            self.route_to_doc(page_idx, |doc| {
+                doc.set_raster_mask_clip(page_idx, &uid, Some(new_val));
+            });
+            // Persist so it survives a reload / save-to-project (whole-page raster save preserves it).
+            self.persist_current_page_rasters(page_idx);
         }
         if let Some((idx, up)) = move_z {
             self.move_raster_in_unified_z(page_idx, idx, up);

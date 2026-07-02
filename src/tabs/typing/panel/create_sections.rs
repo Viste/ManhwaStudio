@@ -414,13 +414,16 @@ impl TypingCreatePanelState {
     pub(super) fn draw_right_section(
         &mut self,
         ui: &mut egui::Ui,
-        mask_panel_open: bool,
-        clean_overlays_visible: bool,
-        strict_pixel_movement: bool,
-        export_default_dir: Option<&Path>,
-        export_status: &TypingExportUiStatus,
-        export_format: TypingExportFormat,
+        inputs: TypingRightSectionInputs<'_>,
     ) -> TypingRightSectionActions {
+        let TypingRightSectionInputs {
+            mask_panel_open,
+            clean_overlays_visible,
+            strict_pixel_movement,
+            export_default_dir,
+            export_status,
+            export_format,
+        } = inputs;
         let mut out = TypingRightSectionActions {
             toggle_mask: false,
             changed_clean_overlays: None,

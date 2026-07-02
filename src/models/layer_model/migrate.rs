@@ -591,7 +591,7 @@ mod tests {
             let arr: Value = serde_json::from_str(&fs::read_to_string(&src).unwrap()).unwrap();
             for o in arr.as_array().unwrap() {
                 if let Some(f) = o.get("file").and_then(Value::as_str) {
-                    let _ = write_png(&layers.join(f), 2, 2, [1, 2, 3, 255]);
+                    write_png(&layers.join(f), 2, 2, [1, 2, 3, 255]);
                 }
             }
         }

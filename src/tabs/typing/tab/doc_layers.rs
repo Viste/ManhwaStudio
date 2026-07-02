@@ -200,7 +200,7 @@ impl TypingTextOverlayLayer {
                     self.raster_layers_by_page.remove(&page_idx);
                 }
             }
-            Err(e) => crate::runtime_log::log_warn(&format!(
+            Err(e) => crate::runtime_log::log_warn(format!(
                 "не удалось изменить порядок слоя в общем Z: {e}"
             )),
         }
@@ -678,23 +678,25 @@ impl TypingTextOverlayLayer {
         let texture_id = texture.id();
         // Deformed raster: positioned by its cols×rows mesh (absolute page px), exactly like a
         // deformed text overlay. The affine transform does not apply while deformed.
-        if let Some(grid) = &layer.deform {
-            if grid.cols >= 2 && grid.rows >= 2 && grid.points_px.len() == grid.cols * grid.rows {
-                let mesh_scene: Vec<Pos2> = grid
-                    .points_px
-                    .iter()
-                    .map(|p| scene_from_page_px(image_rect, zoom, *p))
-                    .collect();
-                draw_textured_deform_mesh(
-                    painter,
-                    texture_id,
-                    &mesh_scene,
-                    grid.cols,
-                    grid.rows,
-                    Color32::WHITE,
-                );
-                return;
-            }
+        if let Some(grid) = &layer.deform
+            && grid.cols >= 2
+            && grid.rows >= 2
+            && grid.points_px.len() == grid.cols * grid.rows
+        {
+            let mesh_scene: Vec<Pos2> = grid
+                .points_px
+                .iter()
+                .map(|p| scene_from_page_px(image_rect, zoom, *p))
+                .collect();
+            draw_textured_deform_mesh(
+                painter,
+                texture_id,
+                &mesh_scene,
+                grid.cols,
+                grid.rows,
+                Color32::WHITE,
+            );
+            return;
         }
         // Transform: center in page px, uniform scale, rotation (radians). Corners are the
         // image quad centered on (cx, cy), scaled and rotated, then mapped page-px -> scene.

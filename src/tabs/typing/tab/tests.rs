@@ -87,7 +87,7 @@
             opacity: 1.0,
             transform: crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
             deform: None,
-            rgba: vec![255, 0, 0, 255].repeat(10 * 10),
+            rgba: [255, 0, 0, 255].repeat(10 * 10),
             size_px: [10, 10],
             band_z: 0,
             mask_clip_enabled: false,
@@ -132,7 +132,7 @@
             opacity: 1.0,
             transform: crate::models::layer_model::manifest::TransformRec { cx: 10.0, cy: 10.0, rotation: 0.0, scale: 1.0 },
             deform: None,
-            rgba: vec![255, 0, 0, 255].repeat(10 * 10),
+            rgba: [255, 0, 0, 255].repeat(10 * 10),
             size_px: [10, 10],
             band_z: 0,
             mask_clip_enabled: mask_clip,
@@ -214,7 +214,7 @@
         assert_eq!(text_preview_label("  Привет", 5), "Приве...");
         // Cyrillic char-boundary safety: exactly 5 chars taken, no byte-panic on multibyte text.
         let long = "Текстовая строка";
-        assert_eq!(long.chars().count() > 5, true);
+        assert!(long.chars().count() > 5);
         assert_eq!(text_preview_label(long, 5), "Текст...");
         // A 5-char prefix that is ALL dots stays as-is (>= 3).
         assert_eq!(text_preview_label(".....", 5), ".....");

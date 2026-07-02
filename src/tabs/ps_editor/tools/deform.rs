@@ -83,10 +83,10 @@ impl PsTool for DeformTool {
     fn interact(&mut self, ctx: &mut PsToolContext<'_>) -> ToolOutcome {
         use crate::trace::cat;
         let outcome = ToolOutcome::default();
-        if !ctx.primary_down {
-            if let Some(drag) = self.drag.take() {
-                crate::trace_log!(cat::INPUT, "deform drag_end point_idx={}", drag.point_idx);
-            }
+        if !ctx.primary_down
+            && let Some(drag) = self.drag.take()
+        {
+            crate::trace_log!(cat::INPUT, "deform drag_end point_idx={}", drag.point_idx);
         }
 
         let view = ctx.view;
@@ -124,21 +124,23 @@ impl PsTool for DeformTool {
 
         if let Some(pointer) = ctx.pointer_image {
             // Begin a grid-point drag on a fresh press over a handle inside the viewport.
-            if ctx.primary_pressed && ctx.pointer_in_viewport && self.drag.is_none() {
-                if let Some(idx) = self.hit_test(&view, &points, pointer) {
-                    crate::trace_log!(
-                        cat::INPUT,
-                        "deform drag_begin point_idx={} at=({:.1},{:.1})",
-                        idx,
-                        pointer.x,
-                        pointer.y
-                    );
-                    self.drag = Some(PointDrag {
-                        point_idx: idx,
-                        start_point: points[idx],
-                        start_pointer: pointer,
-                    });
-                }
+            if ctx.primary_pressed
+                && ctx.pointer_in_viewport
+                && self.drag.is_none()
+                && let Some(idx) = self.hit_test(&view, &points, pointer)
+            {
+                crate::trace_log!(
+                    cat::INPUT,
+                    "deform drag_begin point_idx={} at=({:.1},{:.1})",
+                    idx,
+                    pointer.x,
+                    pointer.y
+                );
+                self.drag = Some(PointDrag {
+                    point_idx: idx,
+                    start_point: points[idx],
+                    start_pointer: pointer,
+                });
             }
 
             // Apply the active drag: move the one control point by the pointer delta (page px).

@@ -1121,10 +1121,13 @@ mod tests {
     fn conservative_wrap_blocks_local_tree_when_moderate_trees_disabled() {
         let targets = [8usize, 10usize, 12usize, 10usize, 8usize];
 
+        // Candidate 114 vs previous line 120 = 5% narrower, i.e. inside the ±6% moderate
+        // band (MODERATE_TREE_EXPANDING_RATIO = 0.94). So it is a tree-width violation only
+        // when moderate trees are DISABLED (strict ratio 1.0) and allowed when enabled.
         assert!(violates_tree_width_rule(
             2,
             Some(120),
-            112.0,
+            114.0,
             false,
             WrapSettings {
                 base_units: 12,
@@ -1142,7 +1145,7 @@ mod tests {
         assert!(!violates_tree_width_rule(
             2,
             Some(120),
-            112.0,
+            114.0,
             false,
             WrapSettings {
                 base_units: 12,
@@ -1166,7 +1169,11 @@ mod tests {
             "монолит коротко еще",
             WrapSettings {
                 base_units: 8,
-                line_unit_targets: Some(&[3, 8, 8]),
+                // Line-0 target 1 makes "монолит" (7u) both unfittable AND un-emergency-splittable
+                // (a valid head needs >=2 alpha), so the DP fails and the approximate fallback runs,
+                // keeping the whole word. Target 3 would let an emergency split satisfy the DP and
+                // the fallback would never trigger (the behavior this test exists to check).
+                line_unit_targets: Some(&[1, 8, 8]),
                 line_width_targets_px: None,
                 line_order_phases: None,
                 strict_line_order: false,
@@ -1225,7 +1232,11 @@ mod tests {
             .map(|line| count_layout_units(line, true))
             .collect::<Vec<_>>();
 
-        for idx in 1..widths.len() {
+        // Only check monotonicity over lines that have a real shape target. Text that cannot
+        // fit the shape without hyphenation legitimately spills into extra overflow lines
+        // beyond `targets`; those are outside the shape and must not be judged against a
+        // fabricated target.
+        for idx in 1..widths.len().min(targets.len()) {
             let previous_target = targets.get(idx - 1).copied().unwrap_or(16);
             let current_target = targets.get(idx).copied().unwrap_or(16);
             if current_target > previous_target {

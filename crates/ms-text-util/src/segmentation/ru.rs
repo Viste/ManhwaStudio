@@ -335,6 +335,11 @@ pub fn should_avoid_emergency_split(text: &str) -> bool {
     if normalized.is_empty() {
         return true;
     }
+    // A block that already contains whitespace has a normal word-wrap point; it must
+    // never be emergency-hyphenated (that would insert a hyphen at an existing space).
+    if normalized.chars().any(char::is_whitespace) {
+        return true;
+    }
     if normalized.contains("://") || normalized.contains('@') {
         return true;
     }

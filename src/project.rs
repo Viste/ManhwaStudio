@@ -2198,10 +2198,10 @@ mod tests {
         super::normalize_page_filenames(&mut pages, &src, &[&clean])?;
 
         // Source is now canonical and the originals are gone.
-        for i in 0..N {
+        for (i, page) in pages.iter().enumerate() {
             assert!(src.join(format!("{i:03}.png")).exists(), "missing src {i:03}");
             assert!(!src.join(format!("{}.png", i + 1)).exists(), "stale src {}", i + 1);
-            assert_eq!(pages[i].path, src.join(format!("{i:03}.png")));
+            assert_eq!(page.path, src.join(format!("{i:03}.png")));
         }
         // Every clean overlay is byte-for-byte intact at its original canonical name.
         for i in 0..N {

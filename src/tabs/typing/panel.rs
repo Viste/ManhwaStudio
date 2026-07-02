@@ -940,6 +940,23 @@ struct FontReloadResult {
     font_groups: Vec<String>,
 }
 
+/// Read-only inputs for `draw_right_section`: current panel/editor state the right-side actions
+/// column reflects (mask visibility, clean-overlay visibility, movement mode, export config).
+struct TypingRightSectionInputs<'a> {
+    /// Whether the clip-mask panel is currently open (drives the toggle button label).
+    mask_panel_open: bool,
+    /// Whether clean overlays are currently shown (drives the checkbox state).
+    clean_overlays_visible: bool,
+    /// Whether strict pixel-snapped movement is enabled (drives the checkbox state).
+    strict_pixel_movement: bool,
+    /// Default directory for the export folder picker, when known.
+    export_default_dir: Option<&'a Path>,
+    /// Current export progress/result to render.
+    export_status: &'a TypingExportUiStatus,
+    /// Currently selected export format.
+    export_format: TypingExportFormat,
+}
+
 struct TypingRightSectionActions {
     toggle_mask: bool,
     changed_clean_overlays: Option<bool>,

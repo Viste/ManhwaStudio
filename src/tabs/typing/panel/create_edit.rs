@@ -453,9 +453,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Межстрочный отступ",
                                                         &mut line_spacing,
-                                                        -300.0..=300.0,
-                                                        2.0,
-                                                        inline_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: -300.0..=300.0,
+                                                            wheel_step: 2.0,
+                                                            font_size_px: inline_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -483,9 +485,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Кернинг",
                                                         &mut kerning,
-                                                        -300.0..=300.0,
-                                                        2.0,
-                                                        inline_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: -300.0..=300.0,
+                                                            wheel_step: 2.0,
+                                                            font_size_px: inline_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -498,9 +502,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Высота символа",
                                                         &mut stretching[1],
-                                                        1.0..=300.0,
-                                                        5.0,
-                                                        inline_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: 1.0..=300.0,
+                                                            wheel_step: 5.0,
+                                                            font_size_px: inline_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -508,9 +514,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Ширина символа",
                                                         &mut stretching[0],
-                                                        1.0..=300.0,
-                                                        5.0,
-                                                        inline_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: 1.0..=300.0,
+                                                            wheel_step: 5.0,
+                                                            font_size_px: inline_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -526,9 +534,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Межстрочный отступ",
                                                         &mut self.line_spacing,
-                                                        -300.0..=300.0,
-                                                        2.0,
-                                                        base_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: -300.0..=300.0,
+                                                            wheel_step: 2.0,
+                                                            font_size_px: base_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -542,9 +552,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Кернинг",
                                                         &mut self.kerning,
-                                                        -300.0..=300.0,
-                                                        2.0,
-                                                        base_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: -300.0..=300.0,
+                                                            wheel_step: 2.0,
+                                                            font_size_px: base_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -552,9 +564,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Высота символа",
                                                         &mut self.glyph_height,
-                                                        1.0..=300.0,
-                                                        5.0,
-                                                        base_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: 1.0..=300.0,
+                                                            wheel_step: 5.0,
+                                                            font_size_px: base_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );
@@ -562,9 +576,11 @@ impl TypingCreatePanelState {
                                                         ui,
                                                         "Ширина символа",
                                                         &mut self.glyph_width,
-                                                        1.0..=300.0,
-                                                        5.0,
-                                                        base_font_size_px,
+                                                        PxOrPercentRowCfg {
+                                                            range: 1.0..=300.0,
+                                                            wheel_step: 5.0,
+                                                            font_size_px: base_font_size_px,
+                                                        },
                                                         &mut changed,
                                                         &mut block_hscroll_by_hovered_param,
                                                     );

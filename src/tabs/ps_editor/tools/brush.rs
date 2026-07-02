@@ -134,16 +134,14 @@ impl PsTool for BrushTool {
         let from = (from.x.round() as i32, from.y.round() as i32);
         let to = (to.x.round() as i32, to.y.round() as i32);
         let layer_size = layer.image.size;
-        paint_line_color(
-            &mut layer.image,
+        let params = StampParams {
             selection,
-            &map,
-            from,
-            to,
-            radius_local,
+            map,
+            radius: radius_local,
             color,
             erase,
-        );
+        };
+        paint_line_color(&mut layer.image, &params, from, to);
 
         outcome.dirty = Some(segment_dirty_rect(from, to, radius_local, layer_size));
         outcome
@@ -219,11 +217,11 @@ impl LocalMap {
         }
     }
 
-    fn to_local(&self, world: Pos2) -> Pos2 {
+    fn to_local(self, world: Pos2) -> Pos2 {
         (self.half + rotate(world - self.center.to_pos2(), -self.rotation) / self.scale).to_pos2()
     }
 
-    fn to_world(&self, local_x: f32, local_y: f32) -> Pos2 {
+    fn to_world(self, local_x: f32, local_y: f32) -> Pos2 {
         (self.center + rotate(Vec2::new(local_x, local_y) - self.half, self.rotation) * self.scale)
             .to_pos2()
     }
@@ -234,26 +232,31 @@ fn rotate(v: Vec2, angle: f32) -> Vec2 {
     Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
-/// Stamps a round brush along the segment `from`→`to` (layer-local px), clipped to `selection`
-/// (page space, mapped through `map`) when present.
-fn paint_line_color(
-    dst: &mut ColorImage,
-    selection: Option<&Selection>,
-    map: &LocalMap,
-    from: (i32, i32),
-    to: (i32, i32),
+/// Shared brush-stamp parameters, bundled so the stamping helpers stay within argument limits.
+struct StampParams<'a> {
+    /// Optional clip selection in page space; pixels outside it are skipped when present.
+    selection: Option<&'a Selection>,
+    /// Layer-local ↔ page-space mapping used for selection clipping.
+    map: LocalMap,
+    /// Disc radius in layer-local pixels.
     radius: i32,
+    /// Fill color; ignored when `erase` is set.
     color: Color32,
+    /// When true, stamps transparency instead of `color`.
     erase: bool,
-) {
+}
+
+/// Stamps a round brush along the segment `from`→`to` (layer-local px), clipped to the selection
+/// (page space, mapped through the params' `map`) when present.
+fn paint_line_color(dst: &mut ColorImage, params: &StampParams, from: (i32, i32), to: (i32, i32)) {
     let dx = (to.0 - from.0) as f32;
     let dy = (to.1 - from.1) as f32;
     let distance = (dx * dx + dy * dy).sqrt();
     if distance <= f32::EPSILON {
-        stamp_circle(dst, selection, map, from.0, from.1, radius, color, erase);
+        stamp_circle(dst, params, from.0, from.1);
         return;
     }
-    let step = (radius as f32 * 0.45).max(1.0);
+    let step = (params.radius as f32 * 0.45).max(1.0);
     let stamps = (distance / step).ceil() as usize;
     let mut last = (i32::MIN, i32::MIN);
     for i in 0..=stamps {
@@ -263,29 +266,23 @@ fn paint_line_color(
         if (sx, sy) == last {
             continue;
         }
-        stamp_circle(dst, selection, map, sx, sy, radius, color, erase);
+        stamp_circle(dst, params, sx, sy);
         last = (sx, sy);
     }
 }
 
-/// Fills a clipped disc of `radius` at layer-local `(cx, cy)`. When a `selection` is present each
-/// pixel is mapped back to page space through `map` and skipped if it falls outside the selection.
-#[allow(clippy::too_many_arguments)]
-fn stamp_circle(
-    dst: &mut ColorImage,
-    selection: Option<&Selection>,
-    map: &LocalMap,
-    cx: i32,
-    cy: i32,
-    radius: i32,
-    color: Color32,
-    erase: bool,
-) {
-    let r = radius.max(1);
+/// Fills a clipped disc of `params.radius` at layer-local `(cx, cy)`. When a selection is present
+/// each pixel is mapped back to page space through `params.map` and skipped if it falls outside it.
+fn stamp_circle(dst: &mut ColorImage, params: &StampParams, cx: i32, cy: i32) {
+    let r = params.radius.max(1);
     let r2 = r * r;
     let w = dst.size[0] as i32;
     let h = dst.size[1] as i32;
-    let fill = if erase { Color32::TRANSPARENT } else { color };
+    let fill = if params.erase {
+        Color32::TRANSPARENT
+    } else {
+        params.color
+    };
     let y0 = (cy - r).max(0);
     let y1 = (cy + r).min(h - 1);
     for y in y0..=y1 {
@@ -302,8 +299,8 @@ fn stamp_circle(
         }
         let row = y as usize * dst.size[0];
         for x in sx0..=sx1 {
-            if let Some(sel) = selection {
-                let world = map.to_world(x as f32 + 0.5, y as f32 + 0.5);
+            if let Some(sel) = params.selection {
+                let world = params.map.to_world(x as f32 + 0.5, y as f32 + 0.5);
                 if world.x < 0.0
                     || world.y < 0.0
                     || !sel.contains(world.x as usize, world.y as usize)

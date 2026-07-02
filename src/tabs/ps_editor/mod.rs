@@ -1679,16 +1679,17 @@ impl PsEditorTabState {
     /// Applies a row click to the panel selection: plain = replace, Ctrl/Cmd = toggle, Shift = range
     /// over the displayed selectable rows (`row_sels`) from the anchor.
     fn select_row(&mut self, sel: RowSel, mods: egui::Modifiers, row_sels: &[RowSel]) {
-        if mods.shift && !row_sels.is_empty() {
-            if let Some(anchor) = self.panel_anchor.clone() {
-                let a = row_sels.iter().position(|r| *r == anchor);
-                let b = row_sels.iter().position(|r| *r == sel);
-                if let (Some(a), Some(b)) = (a, b) {
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    self.panel_selection = row_sels[lo..=hi].iter().cloned().collect();
-                    self.panel_primary = Some(sel);
-                    return;
-                }
+        if mods.shift
+            && !row_sels.is_empty()
+            && let Some(anchor) = self.panel_anchor.clone()
+        {
+            let a = row_sels.iter().position(|r| *r == anchor);
+            let b = row_sels.iter().position(|r| *r == sel);
+            if let (Some(a), Some(b)) = (a, b) {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                self.panel_selection = row_sels[lo..=hi].iter().cloned().collect();
+                self.panel_primary = Some(sel);
+                return;
             }
             // No usable anchor: fall through to a plain select.
         }
@@ -4393,13 +4394,15 @@ mod tests {
         let first_uid = stack.layer(first).unwrap().uid.to_string();
         let second_uid = stack.layer(second).unwrap().uid.to_string();
 
-        let mut ps = PsEditorTabState::default();
         // Band-Z: `second` is the BOTTOM band (z=0), `first` is the TOP band (z=1) — reverse of stack.
-        ps.bands = vec![
-            Band::Raster { uid: second_uid.clone(), z: 0 },
-            Band::Raster { uid: first_uid.clone(), z: 1 },
-        ];
-        ps.stack = Some(stack);
+        let ps = PsEditorTabState {
+            bands: vec![
+                Band::Raster { uid: second_uid.clone(), z: 0 },
+                Band::Raster { uid: first_uid.clone(), z: 1 },
+            ],
+            stack: Some(stack),
+            ..Default::default()
+        };
 
         // `first` is visually on top (band z=1): directly below it is `second` (band z=0), NOT a base
         // layer and NOT its stack neighbour.

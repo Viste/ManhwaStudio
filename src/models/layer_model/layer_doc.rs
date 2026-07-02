@@ -754,12 +754,12 @@ impl LayerDoc {
             uid,
             mask_clip
         );
-        if let Some(node) = self.node_mut(page_idx, uid) {
-            if let NodeBody::Raster { mask_clip: m, .. } = &mut node.body {
-                *m = mask_clip;
-                node.bump_generation();
-                self.bump_version();
-            }
+        if let Some(node) = self.node_mut(page_idx, uid)
+            && let NodeBody::Raster { mask_clip: m, .. } = &mut node.body
+        {
+            *m = mask_clip;
+            node.bump_generation();
+            self.bump_version();
         }
     }
 
@@ -781,18 +781,17 @@ impl LayerDoc {
             display_image.size[0],
             display_image.size[1]
         );
-        if let Some(node) = self.node_mut(page_idx, uid) {
-            if let NodeBody::Raster {
+        if let Some(node) = self.node_mut(page_idx, uid)
+            && let NodeBody::Raster {
                 effects: e,
                 display_image: d,
                 ..
             } = &mut node.body
-            {
-                *e = effects;
-                *d = display_image;
-                node.bump_generation();
-                self.bump_version();
-            }
+        {
+            *e = effects;
+            *d = display_image;
+            node.bump_generation();
+            self.bump_version();
         }
     }
 
@@ -962,21 +961,20 @@ impl LayerDoc {
             effects.len(),
             pixels_dirty
         );
-        if let Some(node) = self.node_mut(page_idx, uid) {
-            if let NodeBody::Raster {
+        if let Some(node) = self.node_mut(page_idx, uid)
+            && let NodeBody::Raster {
                 base_image: b,
                 display_image: d,
                 effects: e,
                 ..
             } = &mut node.body
-            {
-                *b = base_image;
-                *d = display_image;
-                *e = effects;
-                node.pixels_dirty = pixels_dirty;
-                node.bump_generation();
-                self.bump_version();
-            }
+        {
+            *b = base_image;
+            *d = display_image;
+            *e = effects;
+            node.pixels_dirty = pixels_dirty;
+            node.bump_generation();
+            self.bump_version();
         }
     }
 
@@ -998,19 +996,18 @@ impl LayerDoc {
             image.size[0],
             image.size[1]
         );
-        if let Some(node) = self.node_mut(page_idx, uid) {
-            if let NodeBody::Text {
+        if let Some(node) = self.node_mut(page_idx, uid)
+            && let NodeBody::Text {
                 render_data: r,
                 image: i,
                 ..
             } = &mut node.body
-            {
-                *r = render_data;
-                *i = image;
-                node.pixels_dirty = true;
-                node.bump_generation();
-                self.bump_version();
-            }
+        {
+            *r = render_data;
+            *i = image;
+            node.pixels_dirty = true;
+            node.bump_generation();
+            self.bump_version();
         }
     }
 
@@ -1271,17 +1268,16 @@ impl LayerDoc {
                 display_image,
                 ..
             } = &node.body
+                && !effects.is_empty()
             {
-                if !effects.is_empty() {
-                    persist::update_raster_effects(
-                        layers_dir,
-                        page_idx,
-                        &node.uid,
-                        effects,
-                        Some(display_image),
-                        fallback_dir,
-                    )?;
-                }
+                persist::update_raster_effects(
+                    layers_dir,
+                    page_idx,
+                    &node.uid,
+                    effects,
+                    Some(display_image),
+                    fallback_dir,
+                )?;
             }
         }
 

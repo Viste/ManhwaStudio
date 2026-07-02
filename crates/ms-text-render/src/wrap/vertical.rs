@@ -235,7 +235,11 @@ fn try_wrap_vertical_paragraph_with_targets(
             .max(1.0) as usize;
 
         if token_is_whitespace {
-            if !current_column.is_empty()
+            if request.preserve_edge_spaces {
+                // Opting out of space-trimming keeps whitespace literal (including edge
+                // spaces and their count), instead of collapsing to a single half-space.
+                current_column.push_str(token.as_str());
+            } else if !current_column.is_empty()
                 && vertical_measure_text_units(current_column.as_str()) < available_chars as f32
             {
                 current_column.push(VERTICAL_HALF_SPACE);

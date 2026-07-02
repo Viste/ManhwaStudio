@@ -247,7 +247,7 @@ impl TypingTextOverlayLayer {
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.migration_rx = None;
-                crate::runtime_log::log_warn("[migrate] migration worker disconnected".to_string());
+                crate::runtime_log::log_warn("[migrate] migration worker disconnected");
                 true
             }
         }

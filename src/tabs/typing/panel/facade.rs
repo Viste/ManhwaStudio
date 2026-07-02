@@ -469,22 +469,26 @@ impl TypingTopPanelState {
                                 TypingTopPanelMode::CreateText => {
                                     self.create_panel.draw_right_section(
                                         ui,
-                                        self.mask_panel_open,
-                                        self.clean_overlays_visible,
-                                        self.strict_pixel_movement,
-                                        self.export_default_dir.as_deref(),
-                                        &self.export_status,
-                                        self.export_format,
+                                        TypingRightSectionInputs {
+                                            mask_panel_open: self.mask_panel_open,
+                                            clean_overlays_visible: self.clean_overlays_visible,
+                                            strict_pixel_movement: self.strict_pixel_movement,
+                                            export_default_dir: self.export_default_dir.as_deref(),
+                                            export_status: &self.export_status,
+                                            export_format: self.export_format,
+                                        },
                                     )
                                 }
                                 TypingTopPanelMode::EditText => self.edit_panel.draw_right_section(
                                     ui,
-                                    self.mask_panel_open,
-                                    self.clean_overlays_visible,
-                                    self.strict_pixel_movement,
-                                    self.export_default_dir.as_deref(),
-                                    &self.export_status,
-                                    self.export_format,
+                                    TypingRightSectionInputs {
+                                        mask_panel_open: self.mask_panel_open,
+                                        clean_overlays_visible: self.clean_overlays_visible,
+                                        strict_pixel_movement: self.strict_pixel_movement,
+                                        export_default_dir: self.export_default_dir.as_deref(),
+                                        export_status: &self.export_status,
+                                        export_format: self.export_format,
+                                    },
                                 ),
                             };
                             if actions.toggle_mask {
