@@ -683,20 +683,47 @@ pub(super) fn sample_control_axis_to_surface(
         .clamp(0.0, (surface_count - 1) as f32) as usize
 }
 
+/// Paints a `cols`x`rows` textured deform-mesh quad grid into `painter`.
+///
+/// `mesh_scene` holds the scene-space vertex positions in row-major order and
+/// must have exactly `cols * rows` entries; UVs are assigned uniformly across
+/// `[0,1]`. `tint` is a PREMULTIPLIED per-vertex color multiplied into the
+/// sampled texel: pass `Color32::WHITE` for unchanged opaque rendering, or a
+/// premultiplied white with reduced alpha (`Color32::from_white_alpha`) to fade
+/// the whole quad. Does nothing when the grid is degenerate (`cols < 2`,
+/// `rows < 2`, or the vertex count mismatches).
 pub(super) fn draw_textured_deform_mesh(
     painter: &egui::Painter,
     texture_id: egui::TextureId,
     mesh_scene: &[Pos2],
     cols: usize,
     rows: usize,
+    tint: Color32,
 ) {
+    if let Some(mesh) = build_textured_deform_mesh(texture_id, mesh_scene, cols, rows, tint) {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+/// Builds the row-major `cols`x`rows` textured deform-mesh quad grid.
+///
+/// See `draw_textured_deform_mesh` for the parameter contract. Returns `None`
+/// when the grid is degenerate (`cols < 2`, `rows < 2`, or `mesh_scene.len()`
+/// does not equal `cols * rows`); otherwise every emitted vertex carries `tint`.
+fn build_textured_deform_mesh(
+    texture_id: egui::TextureId,
+    mesh_scene: &[Pos2],
+    cols: usize,
+    rows: usize,
+    tint: Color32,
+) -> Option<Mesh> {
+    if cols < 2 || rows < 2 || mesh_scene.len() != cols.saturating_mul(rows) {
+        return None;
+    }
+
     let mut mesh = Mesh::with_texture(texture_id);
     mesh.reserve_vertices(mesh_scene.len());
-    mesh.reserve_triangles((cols.saturating_sub(1)) * (rows.saturating_sub(1)) * 2);
-
-    if cols < 2 || rows < 2 || mesh_scene.len() != cols.saturating_mul(rows) {
-        return;
-    }
+    mesh.reserve_triangles((cols - 1) * (rows - 1) * 2);
 
     for row in 0..rows {
         let t = row as f32 / (rows - 1) as f32;
@@ -705,7 +732,7 @@ pub(super) fn draw_textured_deform_mesh(
             mesh.vertices.push(egui::epaint::Vertex {
                 pos: mesh_scene[row * cols + col],
                 uv: Pos2::new(s, t),
-                color: Color32::WHITE,
+                color: tint,
             });
         }
     }
@@ -721,7 +748,36 @@ pub(super) fn draw_textured_deform_mesh(
         }
     }
 
-    painter.add(egui::Shape::mesh(mesh));
+    Some(mesh)
+}
+
+#[cfg(test)]
+mod mesh_tint_tests {
+    use super::*;
+
+    #[test]
+    fn build_textured_deform_mesh_applies_tint_to_every_vertex() {
+        let scene = [
+            Pos2::new(0.0, 0.0),
+            Pos2::new(1.0, 0.0),
+            Pos2::new(0.0, 1.0),
+            Pos2::new(1.0, 1.0),
+        ];
+        let tint = Color32::from_white_alpha(128);
+        let mesh = build_textured_deform_mesh(egui::TextureId::default(), &scene, 2, 2, tint)
+            .expect("2x2 grid is non-degenerate");
+        assert_eq!(mesh.vertices.len(), 4);
+        assert!(mesh.vertices.iter().all(|v| v.color == tint));
+    }
+
+    #[test]
+    fn build_textured_deform_mesh_rejects_degenerate_grid() {
+        let scene = [Pos2::new(0.0, 0.0)];
+        assert!(
+            build_textured_deform_mesh(egui::TextureId::default(), &scene, 1, 1, Color32::WHITE)
+                .is_none()
+        );
+    }
 }
 
 pub(super) fn bilinear_quad_point(quad: [Pos2; 4], s: f32, t: f32) -> Pos2 {

@@ -24,6 +24,7 @@ impl TypingTopPanelState {
         canvas_rect: Rect,
         text_overlays: &mut TypingTextOverlayLayer,
         page_idx: usize,
+        layout_editor_active: bool,
     ) {
         self.create_panel.poll_font_reload_results();
         self.edit_panel.poll_font_reload_results();
@@ -57,7 +58,7 @@ impl TypingTopPanelState {
             }
         }
 
-        self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx);
+        self.draw_vertical_panel(ctx, canvas_rect, text_overlays, page_idx, layout_editor_active);
     }
 
     pub(super) fn apply_use_system_fonts(&mut self, use_system_fonts: bool, persist: bool) {
@@ -106,12 +107,18 @@ impl TypingTopPanelState {
         }
     }
 
+    /// Draws the floating vertical panels (Параметры/Эффекты + Действия/Слои).
+    ///
+    /// When `layout_editor_active` is true the top-left layout-editor panel is on screen; the
+    /// Actions/Layers panel is then pushed below that panel's bottom edge if the two would
+    /// overlap horizontally, so it is not hidden underneath it.
     pub(super) fn draw_vertical_panel(
         &mut self,
         ctx: &egui::Context,
         canvas_rect: Rect,
         text_overlays: &mut TypingTextOverlayLayer,
         page_idx: usize,
+        layout_editor_active: bool,
     ) {
         // Для image-оверлея вкладка «Параметры» показывает только трансформацию, но вкладка
         // «Эффекты» доступна так же, как для текста — эффекты применяются к сторонней картинке.
@@ -374,7 +381,7 @@ impl TypingTopPanelState {
             actions_default_anchor.min.x,
             actions_default_anchor.max.y + TYPING_VERTICAL_ACTIONS_PANEL_PREVIEW_GAP_PX,
         );
-        let actions_pos = self
+        let mut actions_pos = self
             .vertical_actions_panel
             .pos
             .unwrap_or(actions_default_pos)
@@ -392,6 +399,21 @@ impl TypingTopPanelState {
         } else {
             actions_panel_w
         };
+        // While the layout-editor panel floats at the top-left, keep the Actions/Layers panel
+        // from being hidden under it: if the two overlap horizontally, drop the panel's top just
+        // below the layout panel's bottom edge. Uses the layout panel's last-frame rect from
+        // memory (it is drawn after this panel); its Id matches `Area::new("...mode_panel")`.
+        if layout_editor_active
+            && let Some(layout_rect) =
+                ctx.memory(|mem| mem.area_rect(Id::new("typing_layout_editor_mode_panel")))
+        {
+            let overlaps_x =
+                actions_pos.x < layout_rect.right() && actions_pos.x + panel_w_for_tab > layout_rect.left();
+            let min_top = layout_rect.bottom() + TYPING_VERTICAL_PANEL_GAP_PX;
+            if overlaps_x && actions_pos.y < min_top {
+                actions_pos.y = min_top.clamp(min_y, max_y);
+            }
+        }
         let actions_area_response = egui::Area::new(TYPING_VERTICAL_ACTIONS_PANEL_AREA_ID.into())
             .order(egui::Order::Foreground)
             .movable(true)

@@ -460,6 +460,13 @@ pub(super) fn apply_layout_frame_drag(
     Rect::from_min_max(min, max)
 }
 
+/// Handles pointer/keyboard input for the vector-line canvas in the layout editor's
+/// Editing sub-mode (add / move / delete line points).
+///
+/// Returns `true` when a COMPLETED, discrete edit happened this frame — a point added,
+/// a point deleted, or a point-drag that just finished. Returns `false` while a drag is
+/// in progress (per-frame point moves), so the caller re-renders the overlay only once
+/// the edit is settled instead of on every dragged frame.
 pub(super) fn handle_layout_editor_vector_canvas_input(
     editor: &mut TypingLayoutEditorState,
     line_idx: usize,
@@ -468,16 +475,20 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
     zoom: f32,
     response: &egui::Response,
     ctx: &egui::Context,
-) {
+) -> bool {
+    let mut completed_change = false;
     if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
         && let Some(line) = editor.lines.get_mut(line_idx)
     {
-        let _ = line.points.pop();
+        // Only count as a change (worth re-rendering) if a point was actually removed.
+        if line.points.pop().is_some() {
+            completed_change = true;
+        }
         ctx.request_repaint();
     }
 
     let Some(pointer_scene) = response.interact_pointer_pos() else {
-        return;
+        return completed_change;
     };
     let pointer_page = page_px_from_scene(image_rect, zoom, pointer_scene);
     let local = egui::pos2(
@@ -495,6 +506,7 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
                 == line.points.len().checked_sub(1);
         if line.points.is_empty() || shift_creates_next {
             line.points.push(local);
+            completed_change = true;
             ctx.request_repaint();
         }
     }
@@ -529,8 +541,12 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
         ctx.request_repaint();
     }
     if response.drag_stopped() {
-        editor.line_drag = None;
+        // A point-drag that just finished is a completed edit worth re-rendering.
+        if editor.line_drag.take().is_some() {
+            completed_change = true;
+        }
     }
+    completed_change
 }
 
 pub(super) fn clamp_layout_editor_points_to_frame(editor: &mut TypingLayoutEditorState) {

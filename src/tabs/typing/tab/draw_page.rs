@@ -1147,6 +1147,7 @@ impl TypingTextOverlayLayer {
                         &entry.mesh_scene,
                         entry.mesh_cols,
                         entry.mesh_rows,
+                        Color32::WHITE,
                     );
                 }
             }

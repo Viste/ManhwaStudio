@@ -182,7 +182,6 @@ const TEXT_SHAPE_VARIANT_PANEL_PADDING_PX: f32 = 10.0;
 const TEXT_SHAPE_VARIANT_PANEL_MENU_GAP_PX: f32 = 4.0;
 const TEXT_SHAPE_VARIANT_CHECKER_SIDE_PX: f32 = 14.0;
 const TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX: f32 = 360.0;
-const TEXT_LAYOUT_EDITOR_PANEL_HEIGHT_PX: f32 = 520.0;
 const TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX: f32 = 300.0;
 const TEXT_LAYOUT_EDITOR_FRAME_HANDLE_RADIUS_PX: f32 = 6.0;
 const TEXT_LAYOUT_EDITOR_FRAME_MIN_SIDE_PX: f32 = 24.0;
@@ -735,12 +734,6 @@ impl CanvasHooks for TypingHooks<'_> {
         self.text_overlays
             .set_clean_overlays_model(canvas.clean_overlays_model_handle());
         self.text_overlays.flush_edit_save_on_selection_change();
-        if self.text_overlays.layout_editor_editing_active() {
-            self.top_panel.sync_selected_overlay_for_edit(None);
-            self.text_overlays
-                .draw_layout_editor_panels(ctx, canvas_rect);
-            return;
-        }
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
             self.top_panel.sync_selected_overlay_for_edit(None);
@@ -770,7 +763,11 @@ impl CanvasHooks for TypingHooks<'_> {
                 );
             }
         }
-        if !self.top_panel.is_mask_panel_open() {
+        // Skip the shift-drag create UI while the layout editor is Editing: that mode
+        // reuses the canvas for frame/line editing and must not spawn new overlays.
+        if !self.top_panel.is_mask_panel_open()
+            && !self.text_overlays.layout_editor_editing_active()
+        {
             self.text_overlays.draw_create_overlay_ui(
                 ctx,
                 canvas_rect,
@@ -781,15 +778,22 @@ impl CanvasHooks for TypingHooks<'_> {
         }
         // The combined Actions/Layers panel: the «Слои» tab body is rendered by `text_overlays` (which
         // owns the layer/overlay state), routed through the Actions panel's tab UI on `top_panel`.
+        // Read the layout-editor-active flag first (immutable) so it does not alias the mutable
+        // `&mut self.text_overlays` passed into `draw`; the panel uses it to avoid sitting under the
+        // top-left layout-editor panel.
+        let layout_editor_active = self.text_overlays.layout_editor_active();
         self.top_panel.draw(
             ctx,
             canvas_rect,
             &mut self.text_overlays,
             canvas.current_page_idx(),
+            layout_editor_active,
         );
-        if self.text_overlays.layout_editor_preview_active() {
+        // Draws the merged mode+params+opacity panel in Editing and the plain mode
+        // switch in Preview; the params section self-gates on Editing mode.
+        if self.text_overlays.layout_editor_active() {
             self.text_overlays
-                .draw_layout_editor_mode_panel(ctx, canvas_rect);
+                .draw_layout_editor_panels(ctx, canvas_rect);
         }
         self.text_overlays
             .draw_deformation_mode_panel(ctx, canvas_rect);
@@ -1356,6 +1360,9 @@ struct TypingLayoutEditorState {
     lines: Vec<TypingLayoutEditorLine>,
     frame_drag: Option<TypingLayoutFrameDragState>,
     line_drag: Option<TypingLayoutLineDragState>,
+    /// layout-layer preview opacity in [0,1] for the on-canvas dimmed text under
+    /// the frame; Editing sub-mode only; ephemeral (not persisted).
+    preview_opacity: f32,
 }
 
 #[derive(Debug, Clone, Copy)]

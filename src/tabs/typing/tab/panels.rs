@@ -4,7 +4,9 @@ File: tab/panels.rs
 Purpose:
 Panel-drawing methods for the typing tab's canvas overlays: the deformation-mode
 popup, the unified per-page layers list, and the vector layout-editor panels
-(mode/lines panels, editor lifecycle enter/exit, and the on-page editor overlay).
+(the single mode panel that also hosts the vector-lines params + preview-opacity
+slider while Editing, editor lifecycle enter/exit, and the on-page editor overlay
+that paints the edited layer dimmed under the frame).
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
@@ -286,34 +288,46 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// Draws the floating layout-editor UI while the editor is active. No-op when the editor
+    /// is closed. Delegates to the single mode panel, which merges the mode switch, the
+    /// vector-lines params, and the preview-opacity slider (params + slider shown only in Editing).
     pub(super) fn draw_layout_editor_panels(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         if self.layout_editor.is_none() {
             return;
         }
         self.draw_layout_editor_mode_panel(ctx, canvas_rect);
-        if self.layout_editor_editing_active() {
-            self.draw_layout_editor_lines_panel(ctx, canvas_rect);
-        }
     }
 
+    /// Draws the top-left "Редактирование раскладки" panel: title + red "Выйти" + the
+    /// Editing/Preview toggle, and — only in Editing — the "Векторные" vector-lines params
+    /// (in a bounded scroll area) plus a "Прозрачность превью" slider bound to
+    /// `TypingLayoutEditorState::preview_opacity`. The panel is widened in Editing to fit the params.
     pub(super) fn draw_layout_editor_mode_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         let controls_rect =
             ctx.memory(|mem| mem.area_rect(Id::new(CANVAS_LEFT_TOP_CONTROLS_AREA_ID)));
         let default_pos = controls_rect
             .map(|rect| egui::pos2(rect.left(), rect.bottom() + 8.0))
             .unwrap_or(canvas_rect.left_top() + Vec2::new(16.0, 16.0));
+        // Editing hosts the merged vector-lines params + opacity slider, so it needs the
+        // wide panel; Preview only shows the compact mode switch, so it stays narrow.
+        let editing = self.layout_editor_editing_active();
+        let panel_width = if editing {
+            TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX
+        } else {
+            TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX
+        };
         egui::Area::new("typing_layout_editor_mode_panel".into())
             .order(egui::Order::Foreground)
             .movable(true)
             .interactable(true)
             .default_pos(default_pos)
             .show(ctx, |ui| {
-                ui.set_width(TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX);
+                ui.set_width(panel_width);
                 egui::Frame::popup(ui.style())
                     .fill(Color32::from_rgba_unmultiplied(36, 36, 44, 240))
                     .stroke(Stroke::new(1.0, Color32::from_rgb(120, 140, 180)))
                     .show(ui, |ui| {
-                        ui.set_width(TEXT_LAYOUT_EDITOR_MODE_PANEL_WIDTH_PX);
+                        ui.set_width(panel_width);
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("Редактирование раскладки")
@@ -359,38 +373,29 @@ impl TypingTextOverlayLayer {
                                 self.enter_layout_editor_preview(ctx);
                             }
                         });
+                        // The vector-lines params and the on-canvas preview-opacity
+                        // control live inside this panel, but only in Editing mode.
+                        if editing {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Векторные").strong());
+                            egui::ScrollArea::vertical()
+                                .max_height(360.0)
+                                .show(ui, |ui| {
+                                    if let Some(editor) = self.layout_editor.as_mut() {
+                                        draw_layout_editor_vector_lines_tab(ui, editor);
+                                    }
+                                });
+                            ui.separator();
+                            ui.label("Прозрачность превью");
+                            if let Some(editor) = self.layout_editor.as_mut() {
+                                ui.add(
+                                    egui::Slider::new(&mut editor.preview_opacity, 0.0..=1.0)
+                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                        .show_value(true),
+                                );
+                            }
+                        }
                     });
-            });
-    }
-
-    pub(super) fn draw_layout_editor_lines_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
-        let panel_w =
-            TEXT_LAYOUT_EDITOR_PANEL_WIDTH_PX.min((canvas_rect.width() - 24.0).max(220.0));
-        let panel_h =
-            TEXT_LAYOUT_EDITOR_PANEL_HEIGHT_PX.min((canvas_rect.height() - 24.0).max(220.0));
-        let default_pos = egui::pos2(
-            canvas_rect.right() - panel_w - 12.0,
-            canvas_rect.top() + 12.0,
-        );
-        egui::Area::new("typing_layout_editor_lines_panel".into())
-            .order(egui::Order::Foreground)
-            .movable(true)
-            .interactable(true)
-            .default_pos(default_pos)
-            .show(ctx, |ui| {
-                ui.set_width(panel_w);
-                ui.set_min_width(panel_w);
-                ui.set_max_width(panel_w);
-                egui::Frame::popup(ui.style()).show(ui, |ui| {
-                    ui.set_width(panel_w);
-                    ui.set_min_height(panel_h);
-                    let Some(editor) = self.layout_editor.as_mut() else {
-                        return;
-                    };
-                    ui.label(egui::RichText::new("Векторные").strong());
-                    ui.separator();
-                    draw_layout_editor_vector_lines_tab(ui, editor);
-                });
             });
     }
 
@@ -457,6 +462,7 @@ impl TypingTextOverlayLayer {
             lines: loaded_lines,
             frame_drag: None,
             line_drag: None,
+            preview_opacity: 0.5,
         });
         self.selected_overlay_idx = Some(overlay_idx);
         self.transform_mode_overlay_idx = None;
@@ -483,8 +489,19 @@ impl TypingTextOverlayLayer {
             return;
         };
         editor.mode = TypingLayoutEditorMode::Preview;
-        let overlay_idx = editor.overlay_idx;
-        let vector_layout = vector_lines_layout_from_editor(editor);
+        self.rerender_layout_editor_overlay(ctx);
+    }
+
+    /// Re-renders the edited overlay from the layout editor's current frame + vector lines
+    /// and starts a background edit render job, so the on-canvas layer (Preview text, or the
+    /// dimmed Editing-mode preview) reflects the new layout. No-op if the editor is closed or
+    /// the overlay is not text. Called both when entering Preview and after a completed
+    /// Editing-mode line/frame edit.
+    pub(super) fn rerender_layout_editor_overlay(&mut self, ctx: &egui::Context) {
+        let (overlay_idx, vector_layout) = match self.layout_editor.as_ref() {
+            Some(editor) => (editor.overlay_idx, vector_lines_layout_from_editor(editor)),
+            None => return,
+        };
         let Some(overlay) = self.overlays.get_mut(overlay_idx) else {
             self.layout_editor = None;
             return;
@@ -533,6 +550,10 @@ impl TypingTextOverlayLayer {
         self.start_edit_overlay_render_job(edit_request);
     }
 
+    /// Draws the on-canvas layout-editor overlay for `page_idx` (Editing sub-mode only): the frame
+    /// handles, vector lines/dots, and — painted UNDER the frame at `preview_opacity` — the edited
+    /// overlay's current rendered text layer, so the artist can trace vector lines over the real text.
+    /// No-op when the editor is closed, in Preview, or bound to a different page.
     pub(super) fn draw_layout_editor_on_page(
         &mut self,
         ui: &mut egui::Ui,
@@ -567,7 +588,9 @@ impl TypingTextOverlayLayer {
             .active_line_idx
             .min(editor.lines.len().saturating_sub(1));
         editor.active_line_idx = active_line_idx;
-        handle_layout_editor_vector_canvas_input(
+        // Re-render the overlay only once a discrete layout edit settles this frame
+        // (point add/move/delete, or frame resize below), never mid-drag.
+        let mut needs_rerender = handle_layout_editor_vector_canvas_input(
             editor,
             active_line_idx,
             frame_scene,
@@ -619,11 +642,44 @@ impl TypingTextOverlayLayer {
                 && editor.frame_drag.is_some_and(|drag| drag.handle == handle)
             {
                 editor.frame_drag = None;
+                // Frame resize changes the layout box -> re-render the preview layer.
+                needs_rerender = true;
             }
         }
 
+        // Copy the disjoint editor fields before touching `self.overlays`: `editor`
+        // borrows `self.layout_editor`, so reading `self.overlays` alongside it is
+        // allowed under NLL only because these are separate fields of `self`.
+        let overlay_idx = editor.overlay_idx;
+        let preview_opacity = editor.preview_opacity;
+
         let painter = ui.painter().with_clip_rect(clip_rect);
+        // Render the edited overlay's current rendered text layer dimmed UNDER the
+        // frame+dots so the artist can trace the vector lines over the real text.
+        // Clamp is proven to keep the product in [0,255]; the cast cannot lose data.
+        let alpha = (preview_opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        if alpha > 0
+            && let Some(overlay) = self.overlays.get(overlay_idx)
+            && let Some(texture) = overlay.texture.as_ref()
+        {
+            let geometry = overlay_scene_geometry(overlay, image_rect, zoom);
+            draw_textured_deform_mesh(
+                &painter,
+                texture.id(),
+                &geometry.mesh_scene,
+                geometry.mesh_cols,
+                geometry.mesh_rows,
+                Color32::from_white_alpha(alpha),
+            );
+        }
         draw_layout_editor_frame(&painter, frame_scene);
         draw_layout_editor_vector_lines(&painter, frame_scene, zoom, editor);
+
+        // `editor` (and `painter`) are no longer borrowed past this point, so re-rendering
+        // (which needs `&mut self`) is safe. Runs after a completed line/frame edit so the
+        // dimmed preview texture updates once the drag finishes.
+        if needs_rerender {
+            self.rerender_layout_editor_overlay(ctx);
+        }
     }
 }

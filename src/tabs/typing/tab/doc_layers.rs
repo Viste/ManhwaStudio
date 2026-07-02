@@ -685,7 +685,14 @@ impl TypingTextOverlayLayer {
                     .iter()
                     .map(|p| scene_from_page_px(image_rect, zoom, *p))
                     .collect();
-                draw_textured_deform_mesh(painter, texture_id, &mesh_scene, grid.cols, grid.rows);
+                draw_textured_deform_mesh(
+                    painter,
+                    texture_id,
+                    &mesh_scene,
+                    grid.cols,
+                    grid.rows,
+                    Color32::WHITE,
+                );
                 return;
             }
         }
@@ -810,12 +817,6 @@ impl TypingTextOverlayLayer {
         self.layout_editor
             .as_ref()
             .is_some_and(|editor| editor.mode == TypingLayoutEditorMode::Editing)
-    }
-
-    pub(super) fn layout_editor_preview_active(&self) -> bool {
-        self.layout_editor
-            .as_ref()
-            .is_some_and(|editor| editor.mode == TypingLayoutEditorMode::Preview)
     }
 
     pub(super) fn next_shape_variant_preview_id(&mut self) -> u64 {
