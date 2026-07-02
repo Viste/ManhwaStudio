@@ -131,6 +131,24 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   (Ctrl+wheel), so a positive degree value turns text the same visual direction.
   It does NOT affect layout text, so it is excluded from
   `TextRenderShapeCompareParams` (like `anti_aliasing`).
+- `TextRenderParams.line_placement_percent` (`[-100, 100]`, default 0) places
+  each glyph PERPENDICULAR to the line/path at the vector level: `0` centers the
+  glyph ink on the line, `+100` rests it ABOVE (сверху, ink bottom on the line),
+  `-100` BELOW (снизу, ink top on the line). It is a SHOW-only feature of the two
+  line-based modes `Formula` and `CustomVectorLines`. Because those render
+  functions are shared with a HIDE sibling (`Shape` reuses the formula path,
+  `CustomRasterLines` reuses the drawn-lines path), the pipeline router
+  (`effective_line_placement_frac` in `pipeline.rs`) is the single gating source:
+  it feeds the real value only for `Formula`/`CustomVectorLines` and `0.0` for
+  every other mode, so a stale panel value cannot leak into a HIDE mode. The
+  offset is applied by one shared helper (`formula::render::apply_line_placement`,
+  `offset = line_frac * scaled_ink_height / 2` toward the top side; the top side
+  is the negation of the `normal_offset_px` "down" normal `(-sin, cos)`). Both
+  formula spots and the vector-lines `drawn_line_glyph_destination_center_raw`
+  chokepoint use it. COMPAT: the vector-lines path now places the glyph INK
+  CENTER (not the baseline) on the line at 0%, so both line modes share one
+  meaning of 0 = center; projects saved before the key default to 0.0 = center.
+  Like `global_rotation_deg`, it does not affect layout text.
 - `RenderedTextImage.rgba` must always be `width * height * 4` bytes in unmultiplied
   RGBA order. Empty/transparent output must still use valid dimensions where possible.
 - Public renderer errors are `Result<_, String>` because callers surface them directly

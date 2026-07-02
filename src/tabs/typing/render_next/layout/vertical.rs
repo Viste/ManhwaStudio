@@ -1204,6 +1204,7 @@ mod tests {
             // Identity transfer keeps the AA independent of these geometry checks.
             anti_aliasing: AntiAliasingMode::Smooth,
             global_rotation_deg: 0.0,
+            line_placement_percent: 0.0,
         }
     }
 

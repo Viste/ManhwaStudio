@@ -12263,6 +12263,11 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
             .get("global_rotation_deg")
             .and_then(value_as_f32)
             .unwrap_or(0.0),
+        // Perpendicular line placement; absent in projects saved before it -> 0.
+        line_placement_percent: text_params
+            .get("line_placement_percent")
+            .and_then(value_as_f32)
+            .unwrap_or(0.0),
         selected_face_index: text_params
             .get("selected_face_index")
             .and_then(Value::as_u64)
@@ -15821,6 +15826,7 @@ mod tests {
             effects_json: String::new(),
             anti_aliasing: AntiAliasingMode::Strong,
             global_rotation_deg: 0.0,
+            line_placement_percent: 0.0,
         }
     }
 

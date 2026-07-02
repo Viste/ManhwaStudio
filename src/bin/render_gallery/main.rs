@@ -123,6 +123,7 @@ fn base_params() -> TextRenderParams {
         // Mirror the panel default so the golden output matches the app.
         anti_aliasing: AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
+        line_placement_percent: 0.0,
     }
 }
 

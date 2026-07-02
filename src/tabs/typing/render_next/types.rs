@@ -253,6 +253,13 @@ pub struct TextRenderParams {
     /// A non-zero value routes the horizontal path through the rotated renderer
     /// so the canvas auto-grows to the rotated bounds (no clipping).
     pub global_rotation_deg: f32,
+    /// Perpendicular placement of glyphs relative to the layout line/path,
+    /// in percent `[-100, 100]`. Only the line-based SHOW modes honor it
+    /// (`Formula`, `CustomVectorLines`); `Shape`/`CustomRasterLines`/`Normal`
+    /// ignore it. `0` centers each glyph's ink on the line, `+100` rests it
+    /// ABOVE the line (сверху, ink bottom on the line), `-100` BELOW it (снизу,
+    /// ink top on the line). Applied along the path normal at the vector level.
+    pub line_placement_percent: f32,
 }
 
 #[derive(Debug, Clone)]

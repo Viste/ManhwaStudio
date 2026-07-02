@@ -1771,6 +1771,11 @@ struct TypingCreatePanelState {
     /// Global rotation of the whole text block in degrees, applied to glyph
     /// outlines while still vector (before rasterization). 0.0 = no rotation.
     global_rotation_deg: f32,
+    /// Perpendicular placement of glyphs relative to the line/path, in percent
+    /// `[-100, 100]`. `0` centers the glyph ink on the line, `+100` above
+    /// (сверху), `-100` below (снизу). Only shown/used for line-based layouts
+    /// (`Formula`, `CustomVectorLines`).
+    line_placement_percent: f32,
     text_line_mode: TextLineMode,
     vertical_line_direction: VerticalLineDirection,
     text_layout_mode: TextLayoutMode,
@@ -2032,6 +2037,7 @@ impl TypingCreatePanelState {
             width_px: DEFAULT_PREVIEW_WIDTH_PX,
             align: HorizontalAlign::CENTER,
             global_rotation_deg: 0.0,
+            line_placement_percent: 0.0,
             text_line_mode: TextLineMode::Horizontal,
             vertical_line_direction: VerticalLineDirection::RightToLeft,
             text_layout_mode: TextLayoutMode::Normal,
@@ -2573,6 +2579,7 @@ impl TypingCreatePanelState {
                 "align": self.align.legacy_str(),
                 "align_bias": self.align.bias,
                 "global_rotation_deg": self.global_rotation_deg,
+                "line_placement_percent": self.line_placement_percent,
                 "text_line_mode": match self.text_line_mode {
                     TextLineMode::Horizontal => "horizontal",
                     TextLineMode::Vertical => "vertical",
@@ -4397,6 +4404,51 @@ impl TypingCreatePanelState {
             if let Some(steps) = wheel_steps_if_hovered(ui, &rotation_resp) {
                 *changed |=
                     apply_wheel_step_f32(&mut self.global_rotation_deg, steps, 1.0, -180.0, 180.0);
+            }
+
+            // Размещение по линии: перпендикулярный сдвиг глифов относительно
+            // линии/пути. Показывается только для линейных раскладок (формула и
+            // векторные линии); для остальных режимов параметр скрыт и игнорируется
+            // рендером.
+            if matches!(
+                self.text_layout_mode,
+                TextLayoutMode::Formula | TextLayoutMode::CustomVectorLines
+            ) {
+                ui.horizontal(|ui| {
+                    let placement_resp = ui
+                        .add(
+                            WheelSlider::new(&mut self.line_placement_percent, -100.0..=100.0)
+                                .text("Размещение по линии")
+                                .wheel_step(5.0),
+                        )
+                        .on_hover_text(
+                            "Как глифы сидят на линии: сверху, по центру или снизу",
+                        );
+                    mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &placement_resp);
+                    *changed |= placement_resp.changed();
+                    if let Some(steps) = wheel_steps_if_hovered(ui, &placement_resp) {
+                        *changed |= apply_wheel_step_f32(
+                            &mut self.line_placement_percent,
+                            steps,
+                            5.0,
+                            -100.0,
+                            100.0,
+                        );
+                    }
+
+                    if ui.button("⬇").on_hover_text("Снизу линии").clicked() {
+                        self.line_placement_percent = -100.0;
+                        *changed = true;
+                    }
+                    if ui.button("⬍").on_hover_text("По центру линии").clicked() {
+                        self.line_placement_percent = 0.0;
+                        *changed = true;
+                    }
+                    if ui.button("⬆").on_hover_text("Сверху линии").clicked() {
+                        self.line_placement_percent = 100.0;
+                        *changed = true;
+                    }
+                });
             }
 
             let prev_shape = self.text_shape;
@@ -7258,6 +7310,13 @@ impl TypingCreatePanelState {
         {
             self.global_rotation_deg = global_rotation_deg;
         }
+        // Absent in projects saved before perpendicular line placement -> keep 0.0.
+        if let Some(line_placement_percent) = text_params_obj
+            .get("line_placement_percent")
+            .and_then(value_as_f32)
+        {
+            self.line_placement_percent = line_placement_percent;
+        }
         if let Some(text_line_mode) = text_params_obj
             .get("text_line_mode")
             .and_then(Value::as_str)
@@ -7669,6 +7728,7 @@ impl TypingCreatePanelState {
             width_px: width_px.max(1),
             align: self.align,
             global_rotation_deg: self.global_rotation_deg,
+            line_placement_percent: self.line_placement_percent,
             text_line_mode: self.text_line_mode,
             vertical_line_direction: self.vertical_line_direction,
             text_layout_mode: self.text_layout_mode,

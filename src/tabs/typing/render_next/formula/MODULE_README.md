@@ -58,6 +58,16 @@ the line paths.
   search, and `placed_contour_for_transform` all build the outline->world placement with
   the same `glyph_outline_transform` pivot, so a measured contour lands on exactly the
   pixels the glyph is rasterized to (zero shift versus the old bitmap placement).
+- Perpendicular line placement (`TextRenderParams.line_placement_percent`) is applied by
+  the shared `apply_line_placement` helper. For the drawn/vector-line path it is folded
+  INTO `drawn_line_glyph_destination_center_raw`, which now places the glyph INK CENTER on
+  the line at 0% (deliberate change from the old baseline-on-line placement, so both line
+  modes share 0 = center) and then shifts by `line_frac * scaled_ink_height / 2` toward
+  the top side. For the formula path the curve point already IS the ink center, so the
+  same helper shifts `transform.center` in all three spots (bounds, outline draw, bitmap
+  fallback). The effective `line_frac` is threaded in from the pipeline router
+  (`FormulaRenderRequest.line_placement_frac` -> `CustomLineLayoutSettings`), gated to
+  `0.0` for the HIDE siblings `Shape` and `CustomRasterLines`.
 
 ## Editing map
 - To add formula syntax, edit `parser.rs`, then update `eval.rs` if the new syntax

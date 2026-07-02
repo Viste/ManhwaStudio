@@ -188,6 +188,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         effects_json: String::new(),
         anti_aliasing: types::AntiAliasingMode::Strong,
         global_rotation_deg: 0.0,
+        line_placement_percent: 0.0,
     };
 
     let image = match pipeline::smoke_render_text_to_image(&params) {
@@ -234,6 +235,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         &params.effects_json,
         params.anti_aliasing,
         params.global_rotation_deg,
+        params.line_placement_percent,
     ));
     std::hint::black_box((
         &inline_font.label,
@@ -388,6 +390,7 @@ mod tests {
             effects_json: String::new(),
             anti_aliasing: AntiAliasingMode::Strong,
             global_rotation_deg: 0.0,
+            line_placement_percent: 0.0,
         };
 
         let image = match smoke_render_text_to_image(&params) {

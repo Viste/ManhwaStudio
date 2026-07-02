@@ -330,6 +330,26 @@ pub fn apply_effects_to_image(
     Ok(image)
 }
 
+/// Effective perpendicular line-placement fraction in `[-1, 1]` for the current
+/// layout mode.
+///
+/// Perpendicular line placement is a SHOW-only feature of the two line-based
+/// modes (`Formula`, `CustomVectorLines`). The render code for those modes is
+/// shared with a HIDE sibling (`Shape` reuses the formula path,
+/// `CustomRasterLines` reuses the drawn-lines path), so this is the single
+/// gating source: it returns `0.0` for every HIDE / non-line mode so a stale
+/// panel value can never leak into them.
+fn effective_line_placement_frac(params: &TextRenderParams) -> f32 {
+    match params.text_layout_mode {
+        TextLayoutMode::Formula | TextLayoutMode::CustomVectorLines => {
+            (params.line_placement_percent / 100.0).clamp(-1.0, 1.0)
+        }
+        TextLayoutMode::Normal
+        | TextLayoutMode::Shape
+        | TextLayoutMode::CustomRasterLines => 0.0,
+    }
+}
+
 pub fn render_text_to_image(
     params: &TextRenderParams,
     cancel: Option<(&Arc<AtomicU64>, u64)>,
@@ -543,6 +563,9 @@ pub fn render_text_to_image(
             layout_text: layout_text.as_str(),
             font_size_px,
             base_line_height_px: font_size_px,
+            // Gated: only CustomVectorLines carries a non-zero value here;
+            // CustomRasterLines (same render path) resolves to 0.0.
+            line_placement_frac: effective_line_placement_frac(params),
         };
         crate::trace_log!(cat::RENDER, "render_text path=custom_lines mode={:?}", params.text_layout_mode);
         let custom_lines_result = match params.text_layout_mode {
@@ -583,6 +606,9 @@ pub fn render_text_to_image(
             layout_text: layout_text.as_str(),
             font_size_px,
             base_line_height_px: font_size_px,
+            // Gated: only Formula carries a non-zero value here; Shape (same
+            // render path) resolves to 0.0.
+            line_placement_frac: effective_line_placement_frac(params),
         })? {
             FormulaRenderOutcome::Rendered(mut rendered) => {
                 rendered.warnings.extend(warnings);
@@ -2595,6 +2621,7 @@ mod tests {
             // tests keep matching the pre-AA coverage exactly.
             anti_aliasing: AntiAliasingMode::Smooth,
             global_rotation_deg: 0.0,
+            line_placement_percent: 0.0,
         }
     }
 
@@ -3095,6 +3122,169 @@ mod tests {
                 .expect("vector-lines rotated bounds");
         assert!(rotated_h > plain_h, "vector-lines 90°: {rotated_h} !> {plain_h}");
         assert!(rotated_w < plain_w, "vector-lines 90°: {rotated_w} !< {plain_w}");
+    }
+
+    #[test]
+    fn line_placement_shifts_vector_lines_perpendicular() {
+        // A flat horizontal vector line on a fixed (untrimmed) canvas: the
+        // content's top alpha row directly reflects the perpendicular shift.
+        // +100% (сверху) must raise the content, -100% (снизу) must lower it,
+        // and 0% sits between them.
+        fn alpha_min_y(width: u32, height: u32, rgba: &[u8]) -> Option<usize> {
+            let width = width as usize;
+            (0..height as usize)
+                .find(|&y| (0..width).any(|x| rgba[(y * width + x) * 4 + 3] != 0))
+        }
+
+        let mut params = base_params();
+        params.text = "VECTOR".to_string();
+        params.width_px = 260;
+        params.text_layout_mode = TextLayoutMode::CustomVectorLines;
+        params.vector_lines_layout = TextVectorLinesLayoutParams {
+            width_px: 260,
+            height_px: 140,
+            lines: vec![TextVectorLine {
+                points: vec![
+                    TextVectorPoint { x: 8.0, y: 70.0 },
+                    TextVectorPoint { x: 130.0, y: 70.0 },
+                    TextVectorPoint { x: 252.0, y: 70.0 },
+                ],
+                corner_smoothing_px: 16.0,
+                text_direction: TextVectorLineTextDirection::LeftToRight,
+                distance_mode: TextVectorLineDistanceMode::ByLineLength,
+                flip_text: false,
+            }],
+            ..TextVectorLinesLayoutParams::default()
+        };
+
+        params.line_placement_percent = 0.0;
+        let centered = render_text_to_image(&params, None).expect("vector-lines centered render");
+        let centered_min_y = alpha_min_y(centered.width, centered.height, &centered.rgba)
+            .expect("centered content");
+
+        params.line_placement_percent = 100.0;
+        let top = render_text_to_image(&params, None).expect("vector-lines top render");
+        let top_min_y = alpha_min_y(top.width, top.height, &top.rgba).expect("top content");
+
+        params.line_placement_percent = -100.0;
+        let bottom = render_text_to_image(&params, None).expect("vector-lines bottom render");
+        let bottom_min_y =
+            alpha_min_y(bottom.width, bottom.height, &bottom.rgba).expect("bottom content");
+
+        assert!(
+            top_min_y < centered_min_y,
+            "+100% (сверху) must raise content: {top_min_y} !< {centered_min_y}"
+        );
+        assert!(
+            bottom_min_y > centered_min_y,
+            "-100% (снизу) must lower content: {bottom_min_y} !> {centered_min_y}"
+        );
+    }
+
+    #[test]
+    fn line_placement_applied_on_formula_path() {
+        // Mixed-height text (ascenders/descenders) so the per-glyph perpendicular
+        // shift changes the trimmed raster; the direction itself is proven by the
+        // vector-lines test and the `apply_line_placement` unit test.
+        let mut params = base_params();
+        params.text = "Apjqy bd".to_string();
+        params.width_px = 320;
+        params.text_layout_mode = TextLayoutMode::Formula;
+        params.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * w".to_string(),
+            y_expr: "0".to_string(),
+            rotation_expr: "0".to_string(),
+            use_tangent_rotation: false,
+            ..TextFormulaLayoutParams::default()
+        };
+
+        params.line_placement_percent = 0.0;
+        let centered = render_text_to_image(&params, None).expect("formula centered render");
+        assert!(centered.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+
+        params.line_placement_percent = 100.0;
+        let top = render_text_to_image(&params, None).expect("formula top render");
+        assert!(top.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+
+        params.line_placement_percent = -100.0;
+        let bottom = render_text_to_image(&params, None).expect("formula bottom render");
+        assert!(bottom.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+
+        let centered_key = (centered.width, centered.height, centered.rgba);
+        let top_key = (top.width, top.height, top.rgba);
+        let bottom_key = (bottom.width, bottom.height, bottom.rgba);
+        assert!(
+            top_key != centered_key,
+            "formula +100% must change the render vs 0%"
+        );
+        assert!(
+            bottom_key != centered_key,
+            "formula -100% must change the render vs 0%"
+        );
+        assert!(top_key != bottom_key, "formula +100% must differ from -100%");
+    }
+
+    #[test]
+    fn line_placement_ignored_by_shape() {
+        // Shape reuses the formula render path but must HIDE/ignore line
+        // placement: a non-zero percent must produce a byte-identical image.
+        let mut params = base_params();
+        params.text = "shape gating stays byte identical".to_string();
+        params.width_px = 280;
+        params.text_layout_mode = TextLayoutMode::Shape;
+        params.formula_layout = TextFormulaLayoutParams {
+            x_expr: "t * 24".to_string(),
+            y_expr: "0".to_string(),
+            ..TextFormulaLayoutParams::default()
+        };
+
+        params.line_placement_percent = 0.0;
+        let zero = render_text_to_image(&params, None).expect("shape zero render");
+        params.line_placement_percent = 80.0;
+        let nonzero = render_text_to_image(&params, None).expect("shape nonzero render");
+        assert_eq!(zero.width, nonzero.width);
+        assert_eq!(zero.height, nonzero.height);
+        assert_eq!(
+            zero.rgba, nonzero.rgba,
+            "Shape must ignore line_placement_percent"
+        );
+    }
+
+    #[test]
+    fn line_placement_ignored_by_raster_lines() {
+        // CustomRasterLines reuses the drawn-lines render path but must
+        // HIDE/ignore line placement: a non-zero percent must be byte-identical.
+        let mut layout_image = image::RgbaImage::new(260, 80);
+        layout_image.put_pixel(8, 40, image::Rgba([255, 0, 0, 255]));
+        for x in 9..240 {
+            layout_image.put_pixel(x, 40, image::Rgba([255, 0, 0, 128]));
+        }
+        let layout_path = std::env::temp_dir().join(format!(
+            "manhwastudio_line_placement_raster_{}.png",
+            std::process::id()
+        ));
+        layout_image
+            .save(&layout_path)
+            .unwrap_or_else(|error| panic!("should write raster layout image: {error}"));
+
+        let mut params = base_params();
+        params.text = "DRAWN".to_string();
+        params.width_px = 260;
+        params.text_layout_mode = TextLayoutMode::CustomRasterLines;
+        params.drawn_lines_layout = TextDrawnLinesLayoutParams {
+            image_path: Some(layout_path.clone()),
+            ..TextDrawnLinesLayoutParams::default()
+        };
+
+        params.line_placement_percent = 0.0;
+        let zero = render_text_to_image(&params, None).expect("raster zero render");
+        params.line_placement_percent = 80.0;
+        let nonzero = render_text_to_image(&params, None).expect("raster nonzero render");
+        let _ = std::fs::remove_file(layout_path);
+        assert_eq!(
+            zero.rgba, nonzero.rgba,
+            "CustomRasterLines must ignore line_placement_percent"
+        );
     }
 
     #[test]
