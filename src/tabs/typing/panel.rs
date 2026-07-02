@@ -2020,7 +2020,9 @@ impl TypingCreatePanelState {
             text_color_selector: ViewportColorSelector::default(),
             font_size_px: 24.0,
             line_spacing: PxOrPercent::percent(0.0),
-            kerning_mode: KerningMode::Metric,
+            // Default keeps font-pair kerning (byte-identical to the historical
+            // `Metric` default), now named `Auto`.
+            kerning_mode: KerningMode::Auto,
             kerning: PxOrPercent::percent(0.0),
             glyph_height: PxOrPercent::percent(100.0),
             glyph_width: PxOrPercent::percent(100.0),
@@ -2554,7 +2556,8 @@ impl TypingCreatePanelState {
                 "font_size_px": self.font_size_px,
                 "line_spacing": self.line_spacing.to_token(),
                 "kerning_mode": match self.kerning_mode {
-                    KerningMode::Metric => "metric",
+                    KerningMode::Fixed => "fixed",
+                    KerningMode::Auto => "auto",
                     KerningMode::Optical => "optical",
                 },
                 "kerning": self.kerning.to_token(),
@@ -4187,15 +4190,17 @@ impl TypingCreatePanelState {
 
             ui.horizontal(|ui| {
                 ui.label("Кернинг");
+                // Read-only indicator of the global kerning mode (kerning is not a
+                // per-span inline override). Optical is not offered as a choice.
                 ui.add_enabled(
                     false,
                     egui::Button::new("Метрический")
-                        .selected(self.kerning_mode == KerningMode::Metric),
+                        .selected(self.kerning_mode == KerningMode::Fixed),
                 );
                 ui.add_enabled(
                     false,
-                    egui::Button::new("Оптический")
-                        .selected(self.kerning_mode == KerningMode::Optical),
+                    egui::Button::new("Авто")
+                        .selected(self.kerning_mode == KerningMode::Auto),
                 );
             });
             let mut kerning = style.kerning.unwrap_or(self.kerning);
@@ -4249,11 +4254,13 @@ impl TypingCreatePanelState {
 
             ui.horizontal(|ui| {
                 ui.label("Кернинг");
+                // Optical is implemented but intentionally not offered here; only
+                // Fixed ("Метрический") and Auto ("Авто") are user-selectable.
                 *changed |= ui
-                    .selectable_value(&mut self.kerning_mode, KerningMode::Metric, "Метрический")
+                    .selectable_value(&mut self.kerning_mode, KerningMode::Fixed, "Метрический")
                     .changed();
                 *changed |= ui
-                    .selectable_value(&mut self.kerning_mode, KerningMode::Optical, "Оптический")
+                    .selectable_value(&mut self.kerning_mode, KerningMode::Auto, "Авто")
                     .changed();
             });
 
@@ -6267,15 +6274,16 @@ impl TypingCreatePanelState {
 
                                                     ui.horizontal(|ui| {
                                                         ui.label("Кернинг");
+                                                        // Read-only global kerning-mode indicator; Optical not offered.
                                                         ui.add_enabled(
                                                             false,
                                                             egui::Button::new("Метрический")
-                                                                .selected(self.kerning_mode == KerningMode::Metric),
+                                                                .selected(self.kerning_mode == KerningMode::Fixed),
                                                         );
                                                         ui.add_enabled(
                                                             false,
-                                                            egui::Button::new("Оптический")
-                                                                .selected(self.kerning_mode == KerningMode::Optical),
+                                                            egui::Button::new("Авто")
+                                                                .selected(self.kerning_mode == KerningMode::Auto),
                                                         );
                                                     });
 
@@ -6337,8 +6345,9 @@ impl TypingCreatePanelState {
                                                     );
                                                     ui.horizontal(|ui| {
                                                         ui.label("Кернинг");
-                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Metric, "Метрический").changed();
-                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Optical, "Оптический").changed();
+                                                        // Optical is implemented but not offered here; only Fixed/Auto are user-selectable.
+                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Fixed, "Метрический").changed();
+                                                        changed |= ui.selectable_value(&mut self.kerning_mode, KerningMode::Auto, "Авто").changed();
                                                     });
                                                     px_or_percent_param_row(
                                                         ui,
@@ -7183,7 +7192,7 @@ impl TypingCreatePanelState {
             .get("kerning_mode")
             .and_then(Value::as_str)
             .and_then(parse_kerning_mode_str)
-            .unwrap_or(KerningMode::Metric);
+            .unwrap_or(KerningMode::Auto);
         self.kerning = clamp_px_or_percent(
             read_legacy_or_token_px_or_percent(
                 text_params_obj,
@@ -10763,9 +10772,14 @@ fn parse_text_layout_mode_str(raw: &str) -> Option<TextLayoutMode> {
     }
 }
 
+/// Parse a serialized kerning-mode string. Accepts the current tokens
+/// (`"fixed"`/`"auto"`/`"optical"`) and the legacy `"metric"` token, which meant
+/// font-pair kerning and therefore maps to [`KerningMode::Auto`] so old overlays
+/// render identically. Returns `None` for unknown/missing values.
 fn parse_kerning_mode_str(raw: &str) -> Option<KerningMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "metric" => Some(KerningMode::Metric),
+        "fixed" => Some(KerningMode::Fixed),
+        "auto" | "metric" => Some(KerningMode::Auto),
         "optical" => Some(KerningMode::Optical),
         _ => None,
     }

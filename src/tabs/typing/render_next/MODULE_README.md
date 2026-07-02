@@ -85,6 +85,16 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
   shared `glyph_blit.rs` helpers; only color-glyph fallbacks and bitmap
   measurement/bounds still use `raster.rs` bitmaps.
+- `optical.rs`: axis-agnostic pure numeric core for optical kerning
+  (`median_of_gaps`, `optical_delta`, `optical_base_advance`) plus the shared
+  directional gap metric (`optical_pair_gap` over `OpticalAxis`, returning the
+  minimum facing gap as `f32`, `f32::INFINITY` when non-kernable), the
+  `OpticalContourCache` type, and the
+  simplify-tolerance / min-gap-floor constants. Exactly one source of truth for
+  the optical spacing math AND the pair-gap measurement, reused by the horizontal
+  path (`pipeline.rs`) and the vertical path (`layout/vertical.rs`). Only the
+  contour PLACEMENT (the exact draw-pass transform) stays in the axis-specific
+  callers; the scanline gap metric itself lives here. Unit-tested in place.
 - `wrap/`: text wrapping and hyphenation subsystem.
   See `wrap/MODULE_README.md`.
 - `layout/`: layout-to-raster positioning code that is not generic wrapping.
@@ -151,10 +161,63 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   and the `RotatedGlyphPlacement` draw pass (inline-rotated), both using
   `glyph_blit::glyph_outline_transform`; the outline->world pivot lives in
   `glyph_blit.rs`, not here.
+- Kerning-mode contract (`KerningMode`, `types.rs`): `Auto` (user label "Авто")
+  applies font GPOS/`kern` pair kerning — the shaped cosmic-text positions plus
+  manual tracking; it is the byte-identical successor of the historical `Metric`
+  mode. `Fixed` (user label "Метрический") drops font pair kerning by stepping on
+  each glyph's OWN nominal advance (`glyph_blit::nominal_glyph_advance_px`, read
+  from the font `hmtx` table since cosmic-text bakes pair kerning into
+  `LayoutGlyph.w`). `Optical` normalizes true ink-to-ink gaps; it is implemented
+  but NOT offered in the panel UI (only ever set via a loaded/legacy value).
+  Serialization: `Fixed`->`"fixed"`, `Auto`->`"auto"`, `Optical`->`"optical"`; the
+  legacy token `"metric"` deserializes to `Auto` so old overlays render
+  identically. On the vertical path the stacking is ink-height based (no font pair
+  kerning), so `Fixed` and `Auto` coincide there; only `Optical` differs.
+- Horizontal glyph pen positions live in `horizontal_run_layout`. `Auto` (and the
+  `Optical` fallback when a run cannot be optically kerned) is byte-identical to
+  the shaped positions plus manual tracking; `Fixed` uses the nominal own advance.
+  `KerningMode::Optical` is IMPLEMENTED for the horizontal path:
+  `optical_horizontal_run_layout` measures true ink-to-ink gaps between adjacent
+  inked glyphs (outline contours placed through the same
+  `glyph_blit::glyph_outline_transform` pivot as the draw pass) and normalizes
+  them toward the run's median gap. It is gated entirely on `KerningMode::Optical`
+  and shares the bounds/draw/rotated passes' `OutlineCache` plus a per-render ink
+  contour cache. MVP limitation: optical pairs are considered only WITHIN a
+  cosmic-text layout run (pairs straddling a run boundary keep the shaped
+  advance). The pure numeric core (`median_of_gaps`, `optical_delta`,
+  `optical_base_advance`) lives in the shared `optical.rs` module.
+- The optical spacing math (`median_of_gaps`, `optical_delta`,
+  `optical_base_advance`, the directional `optical_pair_gap` metric, the
+  `OpticalContourCache` type, the simplify tolerance and min-gap floor) is
+  axis-agnostic and lives ONLY in `optical.rs`. Both the horizontal
+  (`pipeline.rs`) and vertical (`layout/vertical.rs`) paths reuse it; do not
+  duplicate the formula or the metric. It is unit-tested in `optical.rs`.
+  MEASUREMENT CONTRACT: the per-pair gap is the MINIMUM DIRECTIONAL projected
+  whitespace along the advance axis — the closest facing points — NOT the Euclidean
+  minimum distance (`min_placed_distance` is used only by the on-path/formula
+  spacing, not here). It scans the pair's overlap band (horizontal: shared vertical
+  band, gap = `cur_left - prev_right`; vertical: shared horizontal band,
+  gap = `cur_top - prev_bottom`) and returns the SMALLEST per-scanline gap. That
+  single min gap is both the target for median normalization (so the tightest
+  points become uniform) and the collision floor. No band overlap -> infinite gap
+  (not kerned). The directional projection removes the earlier sign-inversion on
+  slanted/overhanging pairs (e.g. Cyrillic "ст"/"кс") that a diagonal min-distance
+  produced.
+  Optical spacing is exact on the measured layout but sub-pixel-approximate on the
+  rendered pixels: the provisional measurement pen's `SubpixelBin` can differ from
+  the accumulated draw pen by up to ~0.75px/axis. Since `delta` is now applied along
+  the same axis the gap is measured on, the "final gap >= 0.5px" / "gaps converge to
+  the median" contracts hold on the measured layout and are only sub-pixel-approximate
+  on screen.
 - To change wrapping behavior, edit `wrap/`; keep measurement/scoring in
   `horizontal.rs`, dictionary/safety rules in `hyphenation.rs`, shape profiles in
   `shape.rs`, and vertical pre-layout in `vertical.rs`.
 - To change vertical text positioning or optical spacing, edit `layout/vertical.rs`.
+  `KerningMode::Optical` is IMPLEMENTED for the vertical path too: it measures the
+  true top-to-bottom ink whitespace of adjacent inked glyphs in a column and
+  normalizes it toward the column median, gated strictly on Optical (`Fixed`/`Auto`
+  and every non-Optical mode stay byte-identical). It reuses `optical.rs` and shares the vertical
+  render's `OutlineCache` + `OpticalContourCache`.
 - To change formula, shape-path, or custom raster/vector line placement, edit
   `formula/` and `drawn_lines.rs`.
 - To change a JSON effect, update `effects/parse.rs`, the concrete effect module, and

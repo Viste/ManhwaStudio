@@ -9,6 +9,23 @@ Main responsibilities:
 - посчитать column positions и vertical optical spacing без участия старого `render.rs`;
 - собрать итоговый `RenderedTextImage`.
 
+Optical kerning (vertical axis):
+`KerningMode::Optical` re-spaces adjacent inked glyphs of a column. For each pair
+the MINIMUM DIRECTIONAL vertical whitespace is measured from the glyph outlines
+placed through the same draw-pass pivot (`place_optical_vertical_contour` +
+`optical_pair_gap` with `OpticalAxis::Vertical`): the smallest
+`cur_top(x) - prev_bottom(x)` over the pair's overlapping horizontal band (the
+closest facing points; a scanline projection, not a Euclidean min-distance). That
+min gap is normalized toward the column median so the closest points become
+uniform, and the same min gap feeds the collision floor. The pure numeric core
+(`median_of_gaps`/`optical_delta`/`optical_base_advance`/`optical_pair_gap`) is
+shared with the horizontal path in `render_next::optical`.
+Every non-Optical kerning mode keeps `delta == 0` and stays byte-identical to
+the pre-optical stacking. The vertical stacking is ink-height based and never
+applies font pair kerning, so `Fixed` and `Auto` coincide here (only `Optical`
+re-spaces); spaces and line breaks reset the pair chain, so optical kerning never
+crosses them.
+
 Draw path:
 Each drawn glyph rasterizes its true font outline via the shared `glyph_blit`
 helpers (`resolve_outline_for_glyph` + `glyph_outline_transform`) and
@@ -22,15 +39,20 @@ Source:
 - `render_vertical_text`
 - `collect_vertical_render_columns`
 - `compute_vertical_column_positions`
-- `compute_vertical_cell_tops`
-- `optical_vertical_pair_adjustment`
-из старого `src/tabs/typing/render.rs`
+- `compute_vertical_cell_baselines`
+- `optical_vertical_gap_deltas` / `place_optical_vertical_contour`
+частично из старого `src/tabs/typing/render.rs`
 */
 
 use crate::tabs::typing::render_next::glyph_blit::{
-    glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph,
+    glyph_outline_transform, glyph_subpixel_offset, hash_font_id, resolve_outline_for_glyph,
 };
+use crate::tabs::typing::render_next::glyph_contour::PlacedContour;
 use crate::tabs::typing::render_next::inline_styles::InlineStyleSpan;
+use crate::tabs::typing::render_next::optical::{
+    OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX, OpticalAxis, OpticalContourCache, median_of_gaps,
+    optical_base_advance, optical_delta, optical_pair_gap,
+};
 use crate::tabs::typing::render_next::pipeline::{
     GlyphScaleSettings, KerningSettings, inline_glyph_offset_for_glyph,
     inline_glyph_scale_for_glyph, inline_kerning_for_glyph, inline_text_color_for_glyph,
@@ -40,10 +62,10 @@ use crate::tabs::typing::render_next::raster::{
     include_scaled_rect_bounds, rasterize_unscaled_glyph, sample_swash_alpha,
 };
 use crate::tabs::typing::render_next::types::{
-    RenderedTextImage, TextRenderParams, VerticalLineDirection,
+    KerningMode, RenderedTextImage, TextRenderParams, VerticalLineDirection,
 };
 use crate::tabs::typing::render_next::vector::{
-    OutlineCache, build_aa_lut, rasterize_outline_into,
+    OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
 };
 use cosmic_text::{Buffer, FontSystem, LayoutGlyph, SwashCache};
 
@@ -143,13 +165,28 @@ pub(crate) fn render_vertical_text(
         line_extra_spacing_table.first().copied().unwrap_or(0.0),
         direction,
     );
+    // Per-render outline + ink-contour caches. The outline cache feeds both the
+    // draw-pass vector rasterizer and the optical ink measurement; the contour
+    // cache derives each glyph's ink contour once. Created before the bounds pass
+    // so the baselines (which the optical path may re-space) are computed with the
+    // same caches on both passes. Unused for non-Optical kerning modes.
+    let mut outline_cache = OutlineCache::new();
+    let mut contour_cache = OpticalContourCache::new();
+
     let mut bounds = PixelBounds::empty();
     for (column_idx, column) in columns.iter().enumerate() {
         let Some(column_x) = column_positions.get(column_idx).copied() else {
             continue;
         };
-        let cell_baselines =
-            compute_vertical_cell_baselines(column, font_system, &mut cache, font_size_px);
+        let cell_baselines = compute_vertical_cell_baselines(
+            column,
+            params,
+            font_system,
+            &mut cache,
+            &mut outline_cache,
+            &mut contour_cache,
+            font_size_px,
+        );
         for (cell_idx, cell) in column.cells.iter().enumerate() {
             let VerticalRenderCell::Glyph {
                 glyph,
@@ -203,9 +240,6 @@ pub(crate) fn render_vertical_text(
     let x_offset = -bounds.min_x + horizontal_pad as i32 + safety_pad as i32;
     let y_offset = -bounds.min_y + vertical_pad as i32 + safety_pad as i32;
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
-    // Per-render outline cache: vertical cells rasterize the true font outline
-    // (mirroring the horizontal/on-path paths) instead of the swash bitmap.
-    let mut outline_cache = OutlineCache::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
 
@@ -213,8 +247,15 @@ pub(crate) fn render_vertical_text(
         let Some(column_x) = column_positions.get(column_idx).copied() else {
             continue;
         };
-        let cell_baselines =
-            compute_vertical_cell_baselines(column, font_system, &mut cache, font_size_px);
+        let cell_baselines = compute_vertical_cell_baselines(
+            column,
+            params,
+            font_system,
+            &mut cache,
+            &mut outline_cache,
+            &mut contour_cache,
+            font_size_px,
+        );
         for (cell_idx, cell) in column.cells.iter().enumerate() {
             let VerticalRenderCell::Glyph {
                 glyph,
@@ -551,10 +592,24 @@ const VERTICAL_INK_GAP_FRACTION: f32 = 0.1;
 /// (базовый + кернинг). То есть вертикальный шаг определяется реальной высотой глифа,
 /// а не полным em, поэтому при нулевом кернинге символы стоят плотно. Кернинг (в % от
 /// кегля) и пробелы (em-доли) по-прежнему регулируют расстояние.
+///
+/// When `params.kerning_mode == KerningMode::Optical`, the uniform base gap between
+/// two adjacent inked glyphs is additionally nudged by a per-pair optical delta so
+/// the true top-to-bottom ink whitespace of the column converges toward the
+/// column's median gap (`optical_vertical_gap_deltas`). Every non-Optical kerning
+/// mode (`Fixed`/`Auto`) keeps `delta == 0` and stays byte-identical to the pre-optical
+/// stacking. Spaces / line breaks reset the pair chain (a gap is only ever added
+/// between two consecutive `Glyph` cells), so optical kerning never crosses them.
+// Threads the whole per-column layout plus the font system, both per-render caches,
+// and font size; grouping them into a throwaway struct would only hide the plumbing.
+#[allow(clippy::too_many_arguments)]
 fn compute_vertical_cell_baselines(
     column: &VerticalRenderColumn,
+    params: &TextRenderParams,
     font_system: &mut FontSystem,
     cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
     font_size_px: f32,
 ) -> Vec<f32> {
     let base_gap = font_size_px * VERTICAL_INK_GAP_FRACTION;
@@ -568,6 +623,24 @@ fn compute_vertical_cell_baselines(
             VerticalRenderCell::Blank(_) => None,
         })
         .collect::<Vec<_>>();
+
+    // Optical vertical kerning: per-pair signed gap deltas, gated strictly on
+    // Optical. `None` means "keep metric spacing" (delta 0 everywhere) — either a
+    // non-Optical mode or a column with fewer than one measurable finite gap.
+    let optical_deltas = if params.kerning_mode == KerningMode::Optical {
+        optical_vertical_gap_deltas(
+            column,
+            profiles.as_slice(),
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+            font_size_px,
+            base_gap,
+        )
+    } else {
+        None
+    };
 
     let mut baselines = vec![font_size_px; column.cells.len()];
     let mut current_top = 0.0f32;
@@ -584,7 +657,14 @@ fn compute_vertical_cell_baselines(
                     column.cells.get(idx + 1),
                     Some(VerticalRenderCell::Glyph { .. })
                 ) {
-                    current_top += base_gap + kerning.extra_spacing_px(font_size_px);
+                    // `delta` is 0 for non-Optical modes (byte-identical: adding a
+                    // hard 0.0 before the tracking term does not change the sum), and
+                    // the optical nudge for the (idx, idx+1) pair when Optical.
+                    let delta = optical_deltas
+                        .as_ref()
+                        .and_then(|deltas| deltas.get(idx).copied())
+                        .unwrap_or(0.0);
+                    current_top += base_gap + delta + kerning.extra_spacing_px(font_size_px);
                 }
             }
             VerticalRenderCell::Blank(height_mul) => {
@@ -593,6 +673,213 @@ fn compute_vertical_cell_baselines(
         }
     }
     baselines
+}
+
+/// Own vertical advance for one optical vertical step: the metric per-glyph
+/// vertical step from `prev`'s ink-top to `cur`'s ink-top (prev ink height plus the
+/// uniform base gap). Falls back to the bare `base_gap` when the ink height is not
+/// positive/finite (degenerate glyph) via the shared `optical_base_advance`.
+///
+/// `prev_ink_height_px` is the prev glyph's ink height (px); `base_gap_px` is the
+/// uniform metric gap between two glyphs (px).
+#[must_use]
+fn vertical_base_advance(prev_ink_height_px: f32, base_gap_px: f32) -> f32 {
+    // own step = ink height + base gap; metric fallback = the base gap alone.
+    optical_base_advance(prev_ink_height_px + base_gap_px, base_gap_px)
+}
+
+/// Per-pair optical vertical gap deltas for one column.
+///
+/// For every adjacent INKED glyph pair `(idx, idx+1)` the two ink contours are
+/// placed in the metric stacking configuration (prev ink-top at local 0, cur
+/// ink-top at prev's base advance) and the MINIMUM DIRECTIONAL top-to-bottom ink
+/// whitespace is measured with `optical_pair_gap` (`OpticalAxis::Vertical`): the
+/// smallest `cur_top(x) - prev_bottom(x)` over the pair's overlapping horizontal
+/// band (the closest facing points; a scanline projection, not a Euclidean
+/// min-distance). A pair broken by a blank/space, a missing ink profile, an
+/// outline-less (color) glyph, or no horizontal overlap yields an infinite gap and
+/// is not kerned across. The column target is the median of finite per-pair MIN
+/// gaps; a column with fewer than one finite gap returns `None` (caller keeps
+/// metric spacing).
+///
+/// Returns a vector indexed by the pair's first cell (`deltas[idx]` = the nudge for
+/// the gap after cell `idx`); non-pair indices hold `0.0`.
+// Threads the per-column layout and ink profiles plus the font system, both
+// per-render caches, and the base gap; a wrapper struct would just hide the wiring.
+#[allow(clippy::too_many_arguments)]
+fn optical_vertical_gap_deltas(
+    column: &VerticalRenderColumn,
+    profiles: &[Option<GlyphInkProfile>],
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
+    font_size_px: f32,
+    base_gap: f32,
+) -> Option<Vec<f32>> {
+    let cell_count = column.cells.len();
+    // gaps[idx] is the minimum directional projected whitespace of the pair
+    // (idx, idx+1) — the closest facing points; non-pairs stay `f32::INFINITY`.
+    let mut gaps = vec![f32::INFINITY; cell_count];
+    for idx in 0..cell_count.saturating_sub(1) {
+        let (
+            VerticalRenderCell::Glyph {
+                glyph: prev_glyph,
+                glyph_scale: prev_scale,
+                glyph_offset_px: prev_offset,
+                ..
+            },
+            VerticalRenderCell::Glyph {
+                glyph: cur_glyph,
+                glyph_scale: cur_scale,
+                glyph_offset_px: cur_offset,
+                ..
+            },
+        ) = (&column.cells[idx], &column.cells[idx + 1])
+        else {
+            // A blank/space between glyphs resets the pair chain.
+            continue;
+        };
+        let (Some(prev_profile), Some(cur_profile)) = (profiles[idx], profiles[idx + 1]) else {
+            continue;
+        };
+        let base_advance = vertical_base_advance(prev_profile.height_px(), base_gap);
+        // Baselines mirror the draw pass (`baseline = ink_top + font_size - top_px`),
+        // so the measured ink matches the drawn ink: prev ink-top at local 0, cur
+        // ink-top at `base_advance` below it. The metric bounding-box gap is exactly
+        // `base_gap`; the outline whitespace measured here may differ per shape.
+        let prev_baseline = font_size_px - prev_profile.top_px;
+        let cur_baseline = base_advance + font_size_px - cur_profile.top_px;
+        let prev_placed = place_optical_vertical_contour(
+            prev_glyph,
+            prev_baseline,
+            column.visual_width_px,
+            prev_offset[0],
+            *prev_scale,
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+        );
+        let cur_placed = place_optical_vertical_contour(
+            cur_glyph,
+            cur_baseline,
+            column.visual_width_px,
+            cur_offset[0],
+            *cur_scale,
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+        );
+        gaps[idx] = match (prev_placed, cur_placed) {
+            (Some(prev), Some(cur)) => optical_pair_gap(&prev, &cur, OpticalAxis::Vertical),
+            // Outline-less color glyph on either side: not kernable.
+            _ => f32::INFINITY,
+        };
+    }
+
+    // Self-calibrating target: median of finite per-pair MIN gaps. None when the
+    // column has no finite gap to normalize.
+    let target = median_of_gaps(&gaps)?;
+    Some(
+        gaps.iter()
+            .map(|&gap| optical_delta(gap, target, font_size_px))
+            .collect(),
+    )
+}
+
+/// Place a glyph's ink contour in world space using the exact transform the
+/// vertical draw pass uses (upright, `rot = 0`, scale about the bitmap center), so
+/// the measured ink matches the drawn ink.
+///
+/// `baseline_y` is the glyph baseline in layout px. The pen x mirrors the draw
+/// pass's `origin_x` (`../vertical.rs` ~line 265) EXCEPT the per-column constant
+/// `column_x`, which is identical for every glyph of a column and therefore cancels
+/// out of a relative top-to-bottom gap measurement. `visual_width_px` is the column
+/// visual width (px) used for the same in-column horizontal centering as the draw,
+/// and `glyph_offset_x` is the cell's inline `glyph_offset_px[0]` (px). Keeping the
+/// centering and offset here means the measured ink overlap matches the drawn
+/// overlap for glyphs of differing advance width. Returns `None` for a space/empty
+/// glyph (zero-size placement), an outline-less color glyph, or an empty contour —
+/// all treated as non-kernable by the caller. Never panics.
+// Threads the glyph plus its baseline, column width, inline x offset, and draw
+// scale alongside the font system and both per-render caches; a wrapper struct
+// would only hide the draw-pass mirroring these arguments encode.
+#[allow(clippy::too_many_arguments)]
+fn place_optical_vertical_contour(
+    glyph: &LayoutGlyph,
+    baseline_y: f32,
+    visual_width_px: f32,
+    glyph_offset_x: f32,
+    glyph_scale: GlyphScaleSettings,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
+) -> Option<PlacedContour> {
+    // Mirror the draw pass's `origin_x` minus the shared per-column `column_x`:
+    // center the glyph in the column and honor the cell's inline x offset.
+    let pen_x = ((visual_width_px - glyph.w).max(0.0) * 0.5) - glyph.x + glyph_offset_x;
+    let physical = glyph.physical((pen_x, baseline_y), 1.0);
+    let cache_key = physical.cache_key;
+    // Copy the bitmap placement box out before the `cache` image borrow ends.
+    let (glyph_w, glyph_h, placement_left, placement_top, src_left, src_top) = {
+        let Some(image) = cache.get_image(font_system, cache_key) else {
+            return None;
+        };
+        let gw = image.placement.width;
+        let gh = image.placement.height;
+        if gw == 0 || gh == 0 {
+            return None;
+        }
+        (
+            gw as f32,
+            gh as f32,
+            image.placement.left as f32,
+            image.placement.top as f32,
+            (physical.x + image.placement.left) as f32,
+            (physical.y - image.placement.top) as f32,
+        )
+    };
+
+    // Derive the ink contour once per distinct (font, glyph, em); the outline itself
+    // is negatively cached by `OutlineCache`, so an outline-less glyph is cheap to
+    // re-probe even without a contour-cache entry.
+    let contour_key = (
+        hash_font_id(glyph.font_id),
+        glyph.glyph_id,
+        glyph.font_size.to_bits(),
+    );
+    let contour = match contour_cache.entry(contour_key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph)?;
+            entry.insert(glyph_contour_from_outline(
+                &outline,
+                OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX,
+            ))
+        }
+    };
+    if contour.is_empty() {
+        return None;
+    }
+
+    let dst_center_x = src_left + glyph_w * 0.5;
+    let dst_center_y = src_top + glyph_h * 0.5;
+    let transform = glyph_outline_transform(
+        dst_center_x,
+        dst_center_y,
+        0.0,
+        placement_left,
+        placement_top,
+        glyph_w,
+        glyph_h,
+        glyph_scale.width_mul,
+        glyph_scale.height_mul,
+        glyph_subpixel_offset(cache_key),
+    );
+    Some(transform.place_contour(contour))
 }
 
 fn glyph_ink_profile(
@@ -656,8 +943,15 @@ fn glyph_ink_profile_from_image(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_vertical_column_positions;
-    use crate::tabs::typing::render_next::types::VerticalLineDirection;
+    use super::{compute_vertical_column_positions, vertical_base_advance};
+    use crate::tabs::typing::render_next::pipeline::render_text_to_image;
+    use crate::tabs::typing::render_next::types::{
+        AntiAliasingMode, HorizontalAlign, KerningMode, RenderedTextImage,
+        TextDrawnLinesLayoutParams, TextFormulaLayoutParams, TextLayoutMode, TextLineMode,
+        TextRenderParams, TextShape, TextVectorLinesLayoutParams, TextWrapMode,
+        VerticalLineDirection,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn right_to_left_columns_shift_from_total_width() {
@@ -682,4 +976,107 @@ mod tests {
         assert_eq!(positions, vec![16.0, 0.0]);
     }
 
+    #[test]
+    fn vertical_base_advance_uses_step_or_metric_fallback() {
+        // Normal case: the own vertical step is ink height plus the base gap.
+        assert!((vertical_base_advance(30.0, 6.0) - 36.0).abs() < 1e-4);
+        // Degenerate ink height driving the own step non-positive falls back to
+        // the bare base gap so the pair still advances by a sane metric amount.
+        assert!((vertical_base_advance(-10.0, 6.0) - 6.0).abs() < 1e-4);
+        assert!((vertical_base_advance(f32::NAN, 6.0) - 6.0).abs() < 1e-4);
+    }
+
+    fn test_font_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test/PanelCleaner/pcleaner/data/LiberationSans-Regular.ttf")
+    }
+
+    fn vertical_params(text: &str) -> TextRenderParams {
+        TextRenderParams {
+            text: text.to_string(),
+            text_color: [255, 255, 255, 255],
+            font_path: test_font_path(),
+            available_inline_fonts: Vec::new(),
+            font_size_px: 64.0,
+            line_spacing_px: 0.0,
+            line_spacing_percent: 100.0,
+            kerning_mode: KerningMode::Auto,
+            kerning_px: 0.0,
+            kerning_percent: 0.0,
+            glyph_height_percent: 100.0,
+            glyph_width_percent: 100.0,
+            width_px: 400,
+            align: HorizontalAlign::LEFT,
+            selected_face_index: 0,
+            force_bold: false,
+            force_italic: false,
+            uppercase_text: false,
+            trim_extra_spaces: true,
+            hanging_punctuation: false,
+            new_line_after_sentence: false,
+            enable_inline_style_tags: false,
+            text_wrap_mode: TextWrapMode::WholeWords,
+            text_shape: TextShape::Free,
+            shape_min_width_percent: 100.0,
+            shape_variant: 5,
+            compare_shape_with: None,
+            allow_moderate_trees: false,
+            text_line_mode: TextLineMode::Vertical,
+            vertical_line_direction: VerticalLineDirection::RightToLeft,
+            text_layout_mode: TextLayoutMode::Normal,
+            formula_layout: TextFormulaLayoutParams::default(),
+            drawn_lines_layout: TextDrawnLinesLayoutParams::default(),
+            vector_lines_layout: TextVectorLinesLayoutParams::default(),
+            effects_json: String::new(),
+            // Identity transfer keeps the AA independent of these geometry checks.
+            anti_aliasing: AntiAliasingMode::Smooth,
+        }
+    }
+
+    fn render(params: &TextRenderParams) -> RenderedTextImage {
+        render_text_to_image(params, None).expect("vertical render succeeds")
+    }
+
+    #[test]
+    fn vertical_optical_changes_multi_glyph_column_spacing() {
+        // A column with several inked glyphs has measurable ink gaps, so optical
+        // kerning re-spaces it away from the metric stacking.
+        let metric = render(&vertical_params("ГРОМ"));
+        let mut optical_params = vertical_params("ГРОМ");
+        optical_params.kerning_mode = KerningMode::Optical;
+        let optical = render(&optical_params);
+        assert_ne!(
+            (metric.width, metric.height, metric.rgba),
+            (optical.width, optical.height, optical.rgba),
+            "optical vertical kerning must change multi-glyph column spacing"
+        );
+    }
+
+    #[test]
+    fn vertical_optical_single_glyph_columns_match_metric() {
+        // Each column holds one inked glyph, so there is no adjacent pair to
+        // measure: the median has fewer than one finite gap and the column falls
+        // back to metric spacing byte-for-byte.
+        let metric = render(&vertical_params("Г\nО"));
+        let mut optical_params = vertical_params("Г\nО");
+        optical_params.kerning_mode = KerningMode::Optical;
+        let optical = render(&optical_params);
+        assert_eq!(metric.width, optical.width);
+        assert_eq!(metric.height, optical.height);
+        assert_eq!(metric.rgba, optical.rgba);
+    }
+
+    #[test]
+    fn vertical_optical_space_reset_renders_valid_image() {
+        // A space inside a column resets the optical pair chain (no kern across
+        // it). The render must stay valid (unmultiplied `width * height * 4`).
+        let mut params = vertical_params("ГГ ГГ");
+        params.kerning_mode = KerningMode::Optical;
+        let image = render(&params);
+        assert_eq!(
+            image.rgba.len(),
+            image.width as usize * image.height as usize * 4,
+            "vertical optical output must be width * height * 4 bytes"
+        );
+    }
 }

@@ -44,7 +44,8 @@ use crate::tabs::typing::render_next::drawn_lines::{
 };
 use crate::tabs::typing::render_next::font_registry::InlineFontRegistry;
 use crate::tabs::typing::render_next::glyph_blit::{
-    glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph,
+    glyph_outline_transform, glyph_subpixel_offset, nominal_glyph_advance_px,
+    resolve_outline_for_glyph,
 };
 use crate::tabs::typing::render_next::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance,
@@ -55,6 +56,7 @@ use crate::tabs::typing::render_next::vector::{
 use crate::tabs::typing::render_next::inline_styles::{
     InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
 };
+use crate::tabs::typing::render_next::optical::optical_base_advance;
 use crate::tabs::typing::render_next::pipeline::{
     GlyphScaleSettings, KerningSettings, effective_spacing_percent, horizontal_line_offset,
 };
@@ -2082,7 +2084,18 @@ fn assign_formula_seed_advances(
                 let metric_advance = raw.max(glyph_width_floor).max(1.0);
                 let kerning = seeds[glyph_idx + 1].kerning;
                 let base_advance = match kerning.mode {
-                    KerningMode::Metric => metric_advance,
+                    // `Auto` keeps the shaped (font-pair-kerned) advance.
+                    KerningMode::Auto => metric_advance,
+                    // `Fixed` steps by the glyph's OWN nominal (un-kerned) advance,
+                    // dropping font pair kerning and the optical adjustment. The
+                    // shaped advance bakes in pair kerning, so the raw metrics
+                    // table is consulted; falls back to the shaped advance when the
+                    // metric is unavailable.
+                    KerningMode::Fixed => {
+                        let own = nominal_glyph_advance_px(font_system, &seeds[glyph_idx].glyph)
+                            .unwrap_or(metric_advance);
+                        optical_base_advance(own, metric_advance)
+                    }
                     KerningMode::Optical => {
                         metric_advance
                             + optical_horizontal_pair_adjustment(
@@ -2094,7 +2107,7 @@ fn assign_formula_seed_advances(
                     }
                 };
                 let spacing_basis = match kerning.mode {
-                    KerningMode::Metric => metric_advance,
+                    KerningMode::Auto | KerningMode::Fixed => metric_advance,
                     KerningMode::Optical => ((profiles[glyph_idx].width_px()
                         + profiles[glyph_idx + 1].width_px())
                         * 0.5)

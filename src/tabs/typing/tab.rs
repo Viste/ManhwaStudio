@@ -12244,7 +12244,7 @@ fn text_render_params_from_render_data(render_data: &Value) -> Option<TextRender
             .get("kerning_mode")
             .and_then(Value::as_str)
             .and_then(parse_kerning_mode_config_str)
-            .unwrap_or(KerningMode::Metric),
+            .unwrap_or(KerningMode::Auto),
         kerning_px: kerning.as_px_percent().0,
         kerning_percent: kerning.as_px_percent().1,
         glyph_height_percent: glyph_height.as_percent_of(font_size_px),
@@ -12564,9 +12564,14 @@ fn text_vector_point_params_from_value(value: &Value) -> Option<TextVectorPoint>
 }
 
 
+/// Parse a serialized kerning-mode config string. Accepts the current tokens
+/// (`"fixed"`/`"auto"`/`"optical"`) and the legacy `"metric"` token (font-pair
+/// kerning), which maps to [`KerningMode::Auto`] so old projects render
+/// identically. Returns `None` for unknown/missing values.
 fn parse_kerning_mode_config_str(raw: &str) -> Option<KerningMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "metric" => Some(KerningMode::Metric),
+        "fixed" => Some(KerningMode::Fixed),
+        "auto" | "metric" => Some(KerningMode::Auto),
         "optical" => Some(KerningMode::Optical),
         _ => None,
     }
@@ -15781,7 +15786,7 @@ mod tests {
             font_size_px: 24.0,
             line_spacing_px: 4.0,
             line_spacing_percent: 50.0,
-            kerning_mode: KerningMode::Metric,
+            kerning_mode: KerningMode::Auto,
             kerning_px: 0.0,
             kerning_percent: 0.0,
             glyph_height_percent: 100.0,

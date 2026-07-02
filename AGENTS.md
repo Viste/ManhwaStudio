@@ -50,6 +50,8 @@ Rules:
 * When the user asks to fix a specific bug, launch 2-3 explorers in parallel with the same task. Independent explorers surface findings the others miss.
 * Launch independent agents in a single batch so they run concurrently.
 * The "read before editing" obligations in this document (sections 1 and 9) apply to the agents doing the work: explorers and workers must read the relevant `README_AGENT.md`, `MODULE_README.md`, headers, and declaration comments. As manager, instruct them to do so instead of reading the code yourself.
+* **Only the top-level manager (you) spawns sub-agents. Delegation is exactly one level deep.** Explorers, workers, and reviewers must NOT spawn their own sub-agents; they do the assigned work directly and report back. This prevents runaway recursion (a sub-agent re-delegating its whole task) and keeps the task tree flat and auditable.
+* Every prompt you give a sub-agent MUST end with an explicit line stating: "Do NOT spawn or delegate to other sub-agents; perform this work yourself and report back." If a task is too large for one agent, split it yourself into smaller sub-agent tasks at the manager level instead of letting an agent fan out.
 
 Do NOT enter this mode when:
 

@@ -385,9 +385,27 @@ impl HorizontalAlign {
     }
 }
 
+/// Kerning mode for horizontal and formula/on-path glyph spacing (the vertical
+/// path stacks by ink height, where `Fixed` and `Auto` coincide).
+///
+/// - `Fixed` (user label "Метрический"): fixed per-glyph advance built from each
+///   glyph's OWN advance width; font GPOS/`kern` pair kerning is NOT applied.
+///   Manual tracking (`kerning_px`/`kerning_percent`) is added on top.
+/// - `Auto` (user label "Авто"): font glyph-pair kerning (GPOS/`kern`) applied —
+///   cosmic-text `Shaping::Advanced` shaped positions plus manual tracking. This is
+///   the byte-identical successor of the historical `Metric` mode; the legacy
+///   serialized value `"metric"` deserializes to `Auto` so old overlays keep their
+///   font-pair kerning and render identically.
+/// - `Optical`: shape-based optical spacing that normalizes true ink-to-ink gaps
+///   toward the run/column median. Implemented, but hidden from the panel UI (only
+///   ever set through a loaded/legacy project value, never offered as a choice).
+///
+/// Serialization: `Fixed` -> `"fixed"`, `Auto` -> `"auto"`, `Optical` ->
+/// `"optical"`, with legacy `"metric"` mapping to `Auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KerningMode {
-    Metric,
+    Fixed,
+    Auto,
     Optical,
 }
 

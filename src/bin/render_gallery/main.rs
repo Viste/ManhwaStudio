@@ -92,7 +92,7 @@ fn base_params() -> TextRenderParams {
         font_size_px: 48.0,
         line_spacing_px: 0.0,
         line_spacing_percent: 20.0,
-        kerning_mode: KerningMode::Metric,
+        kerning_mode: KerningMode::Auto,
         kerning_px: 0.0,
         kerning_percent: 0.0,
         glyph_height_percent: 100.0,
@@ -209,7 +209,21 @@ fn all_cases() -> Vec<Case> {
     vertical.width_px = 400;
     vertical.text_line_mode = TextLineMode::Vertical;
     vertical.vertical_line_direction = VerticalLineDirection::RightToLeft;
-    cases.push(Case { name: "vertical", params: vertical });
+    cases.push(Case {
+        name: "vertical",
+        params: vertical.clone(),
+    });
+
+    // 7b. Optical-kerning variant of the vertical case. Shares the exact params of
+    // `vertical` except `kerning_mode`, so a diff against `vertical` shows the
+    // optical vertical path in isolation (the Metric `vertical` case stays
+    // byte-identical to the pre-change golden baseline).
+    let mut vertical_optical = vertical;
+    vertical_optical.kerning_mode = KerningMode::Optical;
+    cases.push(Case {
+        name: "vertical_optical",
+        params: vertical_optical,
+    });
 
     // 8. On-path custom vector line following a sampled wave, min-distance mode.
     let mut onpath = base_params();
@@ -247,6 +261,54 @@ fn all_cases() -> Vec<Case> {
     ]"#
     .to_string();
     cases.push(Case { name: "effect_stroke_shadow", params: effects });
+
+    // 10/11. Optical-kerning variants of the horizontal cases. These share the
+    // exact params of `h_left`/`h_justified` except `kerning_mode`, so a diff
+    // against them shows the optical horizontal path in isolation (the Metric
+    // cases above stay byte-identical to the pre-change golden baseline).
+    let mut h_left_optical = base_params();
+    h_left_optical.text = paragraph.to_string();
+    h_left_optical.width_px = 520;
+    h_left_optical.align = HorizontalAlign::LEFT;
+    h_left_optical.kerning_mode = KerningMode::Optical;
+    cases.push(Case { name: "h_left_optical", params: h_left_optical });
+
+    let mut h_justified_optical = base_params();
+    h_justified_optical.text = paragraph.to_string();
+    h_justified_optical.width_px = 380;
+    h_justified_optical.align = HorizontalAlign::JUSTIFY;
+    h_justified_optical.kerning_mode = KerningMode::Optical;
+    cases.push(Case { name: "h_justified_optical", params: h_justified_optical });
+
+    // 12/13/14. Cyrillic Fixed vs Auto vs Optical triplet. All three share
+    // identical params except `kerning_mode`, so diffs isolate each kerning path.
+    // `auto_cyrillic` (font-pair kerning) is byte-identical to the pre-change
+    // `metric_cyrillic` golden (Auto == old Metric); `fixed_cyrillic` drops the
+    // font pair kerning (own-advance spacing) so it visibly differs from Auto when
+    // the font has kern pairs. An inline color span on "текст" exercises the
+    // per-glyph draw scale path in the measurement.
+    let cyrillic_text =
+        "Тестовый <color=#CC2020>текст</color>".to_string();
+    let mut auto_cyrillic = base_params();
+    auto_cyrillic.enable_inline_style_tags = true;
+    auto_cyrillic.text = cyrillic_text.clone();
+    auto_cyrillic.width_px = 640;
+    auto_cyrillic.kerning_mode = KerningMode::Auto;
+    cases.push(Case { name: "auto_cyrillic", params: auto_cyrillic });
+
+    let mut fixed_cyrillic = base_params();
+    fixed_cyrillic.enable_inline_style_tags = true;
+    fixed_cyrillic.text = cyrillic_text.clone();
+    fixed_cyrillic.width_px = 640;
+    fixed_cyrillic.kerning_mode = KerningMode::Fixed;
+    cases.push(Case { name: "fixed_cyrillic", params: fixed_cyrillic });
+
+    let mut optical_cyrillic = base_params();
+    optical_cyrillic.enable_inline_style_tags = true;
+    optical_cyrillic.text = cyrillic_text;
+    optical_cyrillic.width_px = 640;
+    optical_cyrillic.kerning_mode = KerningMode::Optical;
+    cases.push(Case { name: "optical_cyrillic", params: optical_cyrillic });
 
     cases
 }

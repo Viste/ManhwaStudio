@@ -13,6 +13,9 @@ Key functions:
   public numeric accessor) to key the `OutlineCache`.
 - resolve_outline_for_glyph: per-render cached outline lookup for a laid-out
   glyph at its shaped em size.
+- nominal_glyph_advance_px: font `hmtx` (un-kerned) advance of a glyph, the base
+  step for `KerningMode::Fixed` (cosmic-text bakes pair kerning into
+  `LayoutGlyph.w`, so the shaped advance cannot express "no pair kerning").
 - glyph_outline_transform: local->world `GlyphTransform` reproducing the bitmap
   blit's scale+rotation about the bitmap center (the single source of truth for
   the outline->world pivot).
@@ -75,6 +78,30 @@ pub(crate) fn resolve_outline_for_glyph(
     let font = font_system.get_font(font_id)?;
     let key = OutlineKey::new(hash_font_id(font_id), glyph_id, em_px);
     outline_cache.get_or_extract(key, &font.as_swash(), glyph_id, em_px)
+}
+
+/// Nominal (un-kerned) horizontal advance of a laid-out glyph in layout px.
+///
+/// Reads the font's `hmtx` advance for `glyph.glyph_id` scaled to
+/// `glyph.font_size`, WITHOUT any GPOS/`kern` pair adjustment. This is the lever
+/// `KerningMode::Fixed` needs: cosmic-text bakes pair kerning into
+/// `LayoutGlyph.w` (`w == next.x - this.x` by construction), so the shaped
+/// advance cannot express "no pair kerning" and the raw metrics table must be
+/// consulted instead. Returns `None` when the font is unavailable or the metric
+/// is not finite, letting the caller fall back to the shaped advance. Never
+/// panics.
+#[must_use]
+pub(crate) fn nominal_glyph_advance_px(
+    font_system: &mut FontSystem,
+    glyph: &LayoutGlyph,
+) -> Option<f32> {
+    let font = font_system.get_font(glyph.font_id)?;
+    let advance = font
+        .as_swash()
+        .glyph_metrics(&[])
+        .scale(glyph.font_size)
+        .advance_width(glyph.glyph_id);
+    advance.is_finite().then_some(advance)
 }
 
 /// Build the local->world [`GlyphTransform`] that places a glyph outline on

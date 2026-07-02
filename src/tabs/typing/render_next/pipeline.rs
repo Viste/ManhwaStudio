@@ -15,6 +15,17 @@ Main responsibilities:
 Notes:
 - inline-теги проходят через отдельный `inline_styles` слой как для attrs-level rich text,
   так и для glyph-level color/kerning/stretch/offset/line-spacing в horizontal path;
+- horizontal glyph pen positions are computed in `horizontal_run_layout`: `Auto`
+  is byte-identical to the shaped `cosmic-text` positions plus optional manual
+  tracking (font pair kerning applied); `KerningMode::Fixed` steps by each glyph's
+  OWN nominal (un-kerned) advance (`nominal_glyph_advance_px`, no font pair
+  kerning) plus manual tracking; `KerningMode::Optical` re-spaces
+  adjacent inked glyphs per run via `optical_horizontal_run_layout` by measuring
+  true ink-to-ink gaps from glyph outlines (through the same
+  `glyph_blit::glyph_outline_transform` pivot the draw pass uses) and normalizing
+  them toward the run's median gap; the pure numeric core
+  (`median_of_gaps`/`optical_delta`/`optical_base_advance`) lives in the shared
+  `optical` module and is reused by the vertical path;
 - horizontal monochrome glyphs are rasterized from their true font outlines
   (`draw_horizontal_glyph` for the normal path, the `RotatedGlyphPlacement` draw
   pass for the inline-rotated path) via the shared `glyph_blit` helpers; the layout
@@ -41,15 +52,25 @@ use super::inline_styles::{
     collect_requested_inline_font_labels, parse_inline_style_tags, remap_inline_style_spans,
     spans_have_attrs_overrides,
 };
-use super::glyph_blit::{glyph_outline_transform, glyph_subpixel_offset, resolve_outline_for_glyph};
+use super::glyph_blit::{
+    glyph_outline_transform, glyph_subpixel_offset, hash_font_id, nominal_glyph_advance_px,
+    resolve_outline_for_glyph,
+};
+use super::glyph_contour::PlacedContour;
 use super::layout::{VerticalRasterRequest, render_vertical_text};
+use super::optical::{
+    OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX, OpticalAxis, OpticalContourCache, median_of_gaps,
+    optical_base_advance, optical_delta, optical_pair_gap,
+};
 use super::raster::{
     GlyphRgbaView, PixelBounds, RgbaCanvasView, build_glyph_rgba_buffer,
     draw_rotated_scaled_glyph_rgba, draw_scaled_glyph_rgba, include_rotated_rect_bounds,
     include_scaled_rect_bounds, is_cancelled, rasterize_unscaled_glyph,
     trim_rendered_image_to_alpha_bounds,
 };
-use super::vector::{Outline, OutlineCache, build_aa_lut, rasterize_outline_into};
+use super::vector::{
+    Outline, OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
+};
 use super::types::{
     HorizontalAlign, KerningMode, RenderedTextImage, TextLayoutMode, TextLineMode,
     TextRenderParams, TextRenderShapeCompareParams, TextWrapMode,
@@ -68,6 +89,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 const SOFT_HYPHEN: char = '\u{00AD}';
+
 const UNCHANGED_LAYOUT_TEXT_WARNING: &str =
     "Форма текста совпадает с параметрами сравниваемого рендера.";
 
@@ -151,9 +173,13 @@ impl KerningSettings {
         self.spacing_px + basis_px.max(0.0) * (self.spacing_percent / 100.0)
     }
 
+    /// Whether this glyph may take the fast byte-identical shaped-position path
+    /// (cosmic-text `Shaping::Advanced` positions with no manual tracking). Only
+    /// `Auto` qualifies: `Fixed` needs own-advance repositioning and `Optical`
+    /// needs ink-gap normalization, so both must go through the custom path.
     #[must_use]
     pub(crate) fn uses_default_metric_layout(self) -> bool {
-        self.mode == KerningMode::Metric && self.has_zero_adjustment()
+        self.mode == KerningMode::Auto && self.has_zero_adjustment()
     }
 }
 
@@ -568,16 +594,6 @@ pub fn render_text_to_image(
     }
 
     let glyph_scale = GlyphScaleSettings::from_params(params);
-    if params.text_layout_mode == TextLayoutMode::Normal
-        && params.text_line_mode == TextLineMode::Horizontal
-        && params.kerning_mode == KerningMode::Optical
-    {
-        warnings.push(
-            "render_next base pipeline пока использует metric glyph positions для optical kerning"
-                .to_string(),
-        );
-    }
-
     let layout_line_offsets = compute_layout_line_offsets(layout_text.as_str());
     let has_inline_size_overrides = mapped_inline_style_spans
         .as_deref()
@@ -647,6 +663,11 @@ pub fn render_text_to_image(
 
     crate::trace_log!(cat::RENDER, "render_text path=horizontal lines={} align={:?}", layout_line_offsets.len(), params.align);
     let mut cache = SwashCache::new();
+    // Optical horizontal kerning measures glyph ink from outlines; the bounds
+    // pass needs its own outline/contour caches (the draw pass builds separate
+    // ones). Both are no-ops for every non-Optical kerning mode.
+    let mut bounds_outline_cache = OutlineCache::new();
+    let mut bounds_contour_cache = OpticalContourCache::new();
     let mut bounds = PixelBounds::empty();
     let mut line_idx = 0usize;
     let mut runs = buffer.layout_runs().peekable();
@@ -659,6 +680,8 @@ pub fn render_text_to_image(
             &run,
             &mut font_system,
             &mut cache,
+            &mut bounds_outline_cache,
+            &mut bounds_contour_cache,
             layout_line_offsets.as_slice(),
             mapped_inline_style_spans.as_deref(),
             font_size_px,
@@ -803,8 +826,11 @@ pub fn render_text_to_image(
 
     let mut rgba = vec![0u8; out_width as usize * out_height as usize * 4];
     // Per-render outline cache shared across the draw pass; extracts each glyph
-    // outline at most once and is unused by the bounds pass above.
+    // outline at most once. Also reused by the optical-kerning ink measurement in
+    // `horizontal_run_layout`. Independent from the bounds pass caches.
     let mut outline_cache = OutlineCache::new();
+    // Per-render glyph ink-contour cache for optical horizontal kerning.
+    let mut contour_cache = OpticalContourCache::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
     let mut line_idx = 0usize;
@@ -818,6 +844,8 @@ pub fn render_text_to_image(
             &run,
             &mut font_system,
             &mut cache,
+            &mut outline_cache,
+            &mut contour_cache,
             layout_line_offsets.as_slice(),
             mapped_inline_style_spans.as_deref(),
             font_size_px,
@@ -1218,6 +1246,8 @@ fn render_horizontal_rotated(
     let mut cache = SwashCache::new();
     // Per-render outline cache: each glyph outline is extracted at most once.
     let mut outline_cache = OutlineCache::new();
+    // Per-render glyph ink-contour cache for optical horizontal kerning.
+    let mut contour_cache = OpticalContourCache::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
     let mut placements: Vec<RotatedGlyphPlacement> = Vec::new();
@@ -1235,6 +1265,8 @@ fn render_horizontal_rotated(
             &run,
             font_system,
             &mut cache,
+            &mut outline_cache,
+            &mut contour_cache,
             layout_line_offsets,
             inline_style_spans,
             font_size_px,
@@ -1485,14 +1517,31 @@ pub fn smoke_render_text_to_image(params: &TextRenderParams) -> Result<RenderedT
     Ok(image)
 }
 
-// The glyph layout routine needs the rendered glyph run, inline overrides and cached raster
-// metrics together to preserve metric positioning with optional custom spacing.
+/// Compute per-glyph pen positions (`glyph_xs`) and hanging metrics for one
+/// horizontal layout run, honoring inline tracking and the selected kerning mode.
+///
+/// `Auto` mode is byte-identical to cosmic-text's shaped positions plus optional
+/// manual tracking (font pair kerning applied). `Fixed` steps by each glyph's OWN
+/// nominal (un-kerned) advance (`nominal_glyph_advance_px`) so font pair kerning
+/// is dropped, plus manual tracking. When
+/// `params.kerning_mode == KerningMode::Optical`, adjacent inked glyphs are
+/// re-spaced by measuring true ink-to-ink gaps (`optical_horizontal_run_layout`)
+/// and normalizing them toward the run's median gap; a run with fewer than one
+/// finite gap (e.g. a single inked glyph) falls back to the metric accumulation.
+///
+/// `font_system` is also read by `Fixed` (nominal own-advance lookup);
+/// `cache`/`outline_cache`/`contour_cache` are used only by the optical path
+/// (outline extraction + ink measurement) and are untouched for `Auto`/`Fixed`.
+/// Never panics; a glyph without a fillable outline is treated as non-kernable
+/// (delta 0) rather than an error.
 #[allow(clippy::too_many_arguments)]
 fn horizontal_run_layout(
     params: &TextRenderParams,
     run: &LayoutRun<'_>,
-    _font_system: &mut FontSystem,
-    _cache: &mut SwashCache,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
     layout_line_offsets: &[usize],
     inline_style_spans: Option<&[InlineStyleSpan]>,
     font_size_px: f32,
@@ -1535,6 +1584,26 @@ fn horizontal_run_layout(
         };
     }
 
+    // Optical kerning: re-space adjacent inked glyphs by true ink-to-ink gaps.
+    // A run that cannot be optically kerned (fewer than one finite gap) returns
+    // None and falls through to the metric accumulation below.
+    if params.kerning_mode == KerningMode::Optical
+        && let Some(layout) = optical_horizontal_run_layout(
+            params,
+            run,
+            glyph_kernings.as_slice(),
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+            layout_line_offsets,
+            inline_style_spans,
+            font_size_px,
+        )
+    {
+        return layout;
+    }
+
     let mut glyph_xs = Vec::with_capacity(run.glyphs.len());
     let mut current_x = run.glyphs.first().map(|glyph| glyph.x).unwrap_or(0.0);
     glyph_xs.push(current_x);
@@ -1550,8 +1619,21 @@ fn horizontal_run_layout(
         let prev = &run.glyphs[idx - 1];
         let glyph = &run.glyphs[idx];
         let metric_advance = glyph.x - prev.x;
+        // `Fixed` steps by each glyph's OWN (nominal, un-kerned) advance so font
+        // GPOS/`kern` pair kerning is dropped; `Auto` keeps the shaped (kerned)
+        // delta; `Optical` only reaches this branch as a fallback when the run
+        // cannot be optically kerned, where it keeps the shaped delta like `Auto`.
+        // Note: `prev.w == metric_advance` in cosmic-text (pair kerning is baked
+        // into the advance), so the nominal metrics advance is the actual lever.
+        let base_advance = match params.kerning_mode {
+            KerningMode::Fixed => {
+                let own = nominal_glyph_advance_px(font_system, prev).unwrap_or(metric_advance);
+                optical_base_advance(own, metric_advance)
+            }
+            KerningMode::Auto | KerningMode::Optical => metric_advance,
+        };
         let spacing_basis = metric_advance.abs().max(prev.w.max(default_advance));
-        current_x += metric_advance + pair_kerning.extra_spacing_px(spacing_basis);
+        current_x += base_advance + pair_kerning.extra_spacing_px(spacing_basis);
         glyph_xs.push(current_x);
     }
 
@@ -1569,6 +1651,219 @@ fn horizontal_run_layout(
         visual_width_px,
         leading_hang_px,
     }
+}
+
+/// Optical horizontal accumulation for one run.
+///
+/// MVP scope: optical pairs are considered only WITHIN a single layout run;
+/// cosmic-text splits a line into runs at style/font/bidi boundaries, so a pair
+/// that straddles a run boundary is spaced by the shaped advance only. This is a
+/// known limitation of the horizontal optical path.
+///
+/// Algorithm (spec Phase 1):
+/// 1. Base advance is each glyph's OWN shaped advance (`prev.w`), falling back to
+///    the metric advance `cur.x - prev.x` when `prev.w` is not positive/finite.
+/// 2. For every adjacent inked pair the MINIMUM DIRECTIONAL horizontal whitespace
+///    is measured (`optical_pair_gap`, `OpticalAxis::Horizontal`): the smallest
+///    `cur_left(y) - prev_right(y)` over the pair's overlapping vertical band (the
+///    closest facing points), from the glyph outlines placed through the exact
+///    draw-pass transform. This projected measure (not a Euclidean min-distance)
+///    keeps slanted/overhanging features from inverting the sign. Spaces / empty /
+///    outline-less glyphs and pairs with no vertical overlap yield an infinite gap
+///    (delta 0).
+/// 3. The self-calibrating target is the median of all finite per-pair MIN gaps;
+///    fewer than one finite gap returns `None` (caller keeps metric spacing).
+/// 4. Each pair is nudged by `optical_delta` (a signed delta normalized on the
+///    pair MIN gap so the closest points become uniform, clamped to +/- font_size,
+///    then floored on that same MIN gap so the closest points never collide)
+///    applied ON TOP of the base advance and any manual tracking
+///    (`extra_spacing_px`), with the same `spacing_basis` as the metric branch.
+///
+/// Returns `None` to signal "cannot optically kern this run".
+// Threads the full per-run layout and per-glyph kernings plus the font system, both
+// per-render caches, and layout params; a wrapper struct would just hide the wiring.
+#[allow(clippy::too_many_arguments)]
+fn optical_horizontal_run_layout(
+    params: &TextRenderParams,
+    run: &LayoutRun<'_>,
+    glyph_kernings: &[KerningSettings],
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
+    layout_line_offsets: &[usize],
+    inline_style_spans: Option<&[InlineStyleSpan]>,
+    font_size_px: f32,
+) -> Option<HorizontalRunLayout> {
+    let glyph_count = run.glyphs.len();
+    if glyph_count < 2 {
+        return None;
+    }
+
+    // Per-glyph draw scale, mirroring the draw pass (`inline_glyph_scale_for_glyph`)
+    // so measured ink uses exactly the scale the glyph is rasterized with.
+    let glyph_scales: Vec<GlyphScaleSettings> = run
+        .glyphs
+        .iter()
+        .map(|glyph| {
+            inline_glyph_scale_for_glyph(
+                params,
+                inline_style_spans,
+                layout_line_offsets,
+                run.line_i,
+                glyph,
+            )
+        })
+        .collect();
+
+    // gaps[idx] is the minimum directional projected whitespace of the pair
+    // (idx-1, idx) — the closest facing points; index 0 has no pair. The gap is
+    // x-translation invariant (rotation 0), so both glyphs are placed relative to
+    // a shared baseline: prev at pen 0, cur at pen prev.w. `f32::INFINITY` marks a
+    // non-kernable pair (first glyph / space / empty / no overlap).
+    let mut gaps: Vec<f32> = Vec::with_capacity(glyph_count);
+    gaps.push(f32::INFINITY);
+    for idx in 1..glyph_count {
+        let prev = &run.glyphs[idx - 1];
+        let cur = &run.glyphs[idx];
+        let prev_placed = place_optical_horizontal_contour(
+            prev,
+            0.0,
+            glyph_scales[idx - 1],
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+        );
+        let cur_placed = place_optical_horizontal_contour(
+            cur,
+            prev.w,
+            glyph_scales[idx],
+            font_system,
+            cache,
+            outline_cache,
+            contour_cache,
+        );
+        let gap = match (prev_placed, cur_placed) {
+            (Some(p), Some(c)) => optical_pair_gap(&p, &c, OpticalAxis::Horizontal),
+            // Space / empty / outline-less glyph on either side: not kernable.
+            _ => f32::INFINITY,
+        };
+        gaps.push(gap);
+    }
+
+    // Self-calibrating target: the median of finite per-pair MIN gaps. None when
+    // the run has no finite gap to normalize.
+    let target = median_of_gaps(&gaps)?;
+
+    let default_advance = font_size_px.max(1.0) * 0.5;
+    let mut glyph_xs = Vec::with_capacity(glyph_count);
+    let mut current_x = run.glyphs.first().map(|glyph| glyph.x).unwrap_or(0.0);
+    glyph_xs.push(current_x);
+    for idx in 1..glyph_count {
+        let prev = &run.glyphs[idx - 1];
+        let cur = &run.glyphs[idx];
+        let metric_advance = cur.x - prev.x;
+        let base_advance = optical_base_advance(prev.w, metric_advance);
+        let delta = optical_delta(gaps[idx], target, font_size_px);
+        // Keep the manual-tracking basis identical to the metric branch.
+        let spacing_basis = metric_advance.abs().max(prev.w.max(default_advance));
+        current_x += base_advance + delta + glyph_kernings[idx].extra_spacing_px(spacing_basis);
+        glyph_xs.push(current_x);
+    }
+
+    let line_width_px = run
+        .glyphs
+        .iter()
+        .zip(glyph_xs.iter().copied())
+        .map(|(glyph, glyph_x)| glyph_x + glyph.w)
+        .fold(0.0, f32::max);
+    let (visual_width_px, leading_hang_px) =
+        hanging_metrics_for_layout(run, glyph_xs.as_slice(), line_width_px);
+    Some(HorizontalRunLayout {
+        glyph_xs,
+        line_width_px,
+        visual_width_px,
+        leading_hang_px,
+    })
+}
+
+/// Place a glyph's ink contour in world space using the exact transform the
+/// horizontal draw pass (`draw_horizontal_glyph`) uses, so the measured ink
+/// matches the drawn ink.
+///
+/// `pen_x` is the pen x in layout px (the baseline y is irrelevant to the gap and
+/// is fixed at 0). Returns `None` for a space/empty glyph (zero-size placement),
+/// an outline-less color glyph, or an empty contour — all of which are treated as
+/// non-kernable by the caller. Never panics.
+fn place_optical_horizontal_contour(
+    glyph: &LayoutGlyph,
+    pen_x: f32,
+    glyph_scale: GlyphScaleSettings,
+    font_system: &mut FontSystem,
+    cache: &mut SwashCache,
+    outline_cache: &mut OutlineCache,
+    contour_cache: &mut OpticalContourCache,
+) -> Option<PlacedContour> {
+    let physical = glyph.physical((pen_x, 0.0), 1.0);
+    let cache_key = physical.cache_key;
+    // Copy the bitmap placement box out before the `cache` image borrow ends.
+    let (glyph_w, glyph_h, placement_left, placement_top, src_left, src_top) = {
+        let Some(image) = cache.get_image(font_system, cache_key) else {
+            return None;
+        };
+        let gw = image.placement.width;
+        let gh = image.placement.height;
+        if gw == 0 || gh == 0 {
+            return None;
+        }
+        (
+            gw as f32,
+            gh as f32,
+            image.placement.left as f32,
+            image.placement.top as f32,
+            (physical.x + image.placement.left) as f32,
+            (physical.y - image.placement.top) as f32,
+        )
+    };
+
+    // Derive the ink contour once per distinct (font, glyph, em); the outline
+    // itself is negatively cached by `OutlineCache`, so an outline-less glyph is
+    // cheap to re-probe even without a contour-cache entry.
+    let contour_key = (
+        hash_font_id(glyph.font_id),
+        glyph.glyph_id,
+        glyph.font_size.to_bits(),
+    );
+    let contour = match contour_cache.entry(contour_key) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let outline = resolve_outline_for_glyph(font_system, outline_cache, glyph)?;
+            entry.insert(glyph_contour_from_outline(
+                &outline,
+                OPTICAL_CONTOUR_SIMPLIFY_TOLERANCE_PX,
+            ))
+        }
+    };
+    if contour.is_empty() {
+        return None;
+    }
+
+    let dst_center_x = src_left + glyph_w * 0.5;
+    let dst_center_y = src_top + glyph_h * 0.5;
+    let transform = glyph_outline_transform(
+        dst_center_x,
+        dst_center_y,
+        0.0,
+        placement_left,
+        placement_top,
+        glyph_w,
+        glyph_h,
+        glyph_scale.width_mul,
+        glyph_scale.height_mul,
+        glyph_subpixel_offset(cache_key),
+    );
+    Some(transform.place_contour(contour))
 }
 
 fn prepare_source_text(source_text: &str, params: &TextRenderParams) -> String {
@@ -2227,7 +2522,7 @@ mod tests {
             font_size_px: 36.0,
             line_spacing_px: 0.0,
             line_spacing_percent: 100.0,
-            kerning_mode: KerningMode::Metric,
+            kerning_mode: KerningMode::Auto,
             kerning_px: 0.0,
             kerning_percent: 0.0,
             glyph_height_percent: 100.0,
@@ -2259,6 +2554,58 @@ mod tests {
             // tests keep matching the pre-AA coverage exactly.
             anti_aliasing: AntiAliasingMode::Smooth,
         }
+    }
+
+    // The optical pure-numeric core (`median_of_gaps`, `optical_delta`,
+    // `optical_base_advance`) is unit-tested in `super::super::optical` since it
+    // is shared by the horizontal and vertical paths.
+
+    #[test]
+    fn fixed_kerning_drops_font_pair_kerning_versus_auto() {
+        // Text loaded with negative-kern pairs (AV/VA/To/Yo/Wa in LiberationSans).
+        // `Auto` applies the font's GPOS/`kern` pair kerning (shaped positions);
+        // `Fixed` steps by each glyph's OWN advance, so the pairs are NOT pulled
+        // together. With kern pairs present, the two renders must differ.
+        let kern_text = "AVA To Yo Wa VA";
+        let mut auto_params = base_params();
+        auto_params.text = kern_text.to_string();
+        auto_params.width_px = 640;
+        auto_params.kerning_mode = KerningMode::Auto;
+
+        let mut fixed_params = auto_params.clone();
+        fixed_params.kerning_mode = KerningMode::Fixed;
+
+        let auto = render_text_to_image(&auto_params, None)
+            .expect("Auto kerning render should succeed");
+        let fixed = render_text_to_image(&fixed_params, None)
+            .expect("Fixed kerning render should succeed");
+
+        // Fixed spacing is looser (own advance, no negative kern), so the inked
+        // content is at least as wide as Auto and the buffers differ.
+        assert!(
+            fixed.width >= auto.width,
+            "Fixed own-advance spacing should be no narrower than Auto (fixed {} vs auto {})",
+            fixed.width,
+            auto.width
+        );
+        assert_ne!(
+            (auto.width, auto.height, &auto.rgba),
+            (fixed.width, fixed.height, &fixed.rgba),
+            "Fixed must drop font pair kerning and differ from Auto for kern-pair text"
+        );
+    }
+
+    #[test]
+    fn auto_kerning_matches_default_shaped_positions() {
+        // `Auto` with zero manual tracking is the fast byte-identical shaped-position
+        // path (the historical `Metric` behavior). Rendering the same text twice is
+        // deterministic and stable across the enum rename.
+        let mut params = base_params();
+        params.text = "AVA To Yo".to_string();
+        params.kerning_mode = KerningMode::Auto;
+        let a = render_text_to_image(&params, None).expect("Auto render should succeed");
+        let b = render_text_to_image(&params, None).expect("Auto render should succeed");
+        assert_eq!((a.width, a.height, a.rgba), (b.width, b.height, b.rgba));
     }
 
     fn alpha_bounds_from_rgba(width: u32, height: u32, rgba: &[u8]) -> Option<(usize, usize)> {

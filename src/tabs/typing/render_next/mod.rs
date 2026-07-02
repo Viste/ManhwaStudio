@@ -27,6 +27,7 @@ mod glyph_blit;
 mod glyph_contour;
 mod inline_styles;
 mod layout;
+mod optical;
 pub mod pipeline;
 mod raster;
 pub mod types;
@@ -157,7 +158,7 @@ pub(crate) fn touch_runtime_smoke_contract() {
         font_size_px: 24.0,
         line_spacing_px: 28.0,
         line_spacing_percent: 100.0,
-        kerning_mode: types::KerningMode::Metric,
+        kerning_mode: types::KerningMode::Auto,
         kerning_px: 0.0,
         kerning_percent: 0.0,
         glyph_height_percent: 100.0,
@@ -261,7 +262,11 @@ pub(crate) fn touch_runtime_smoke_contract() {
         types::HorizontalAlign::RIGHT,
         types::HorizontalAlign::JUSTIFY,
     ]);
-    std::hint::black_box([types::KerningMode::Metric, types::KerningMode::Optical]);
+    std::hint::black_box([
+        types::KerningMode::Fixed,
+        types::KerningMode::Auto,
+        types::KerningMode::Optical,
+    ]);
     std::hint::black_box([
         types::TextShape::Free,
         types::TextShape::Rectangle,
@@ -351,7 +356,7 @@ mod tests {
             font_size_px: 42.0,
             line_spacing_px: 0.0,
             line_spacing_percent: 100.0,
-            kerning_mode: KerningMode::Metric,
+            kerning_mode: KerningMode::Auto,
             kerning_px: 0.0,
             kerning_percent: 0.0,
             glyph_height_percent: 100.0,
