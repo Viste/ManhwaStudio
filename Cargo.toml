@@ -4,7 +4,7 @@ version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions"]
 
 [features]
 active-logs = []
@@ -21,6 +21,7 @@ path = "src/bin/render_gallery/main.rs"
 ms-log = { path = "crates/ms-log" }
 ms-text-util = { path = "crates/ms-text-util" }
 ms-text-render = { path = "crates/ms-text-render" }
+ms-actions = { path = "crates/ms-actions", features = ["raster"] }
 anyhow = "1"
 arboard = "3"
 chrono = "0.4"

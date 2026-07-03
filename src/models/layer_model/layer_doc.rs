@@ -825,6 +825,38 @@ impl LayerDoc {
         true
     }
 
+    /// Adds a node to a resident page at an EXPLICIT `z`, re-sorting `nodes` bottom-to-top. Unlike
+    /// [`Self::add_node`] (which always places the node on top), this restores a node at a precise Z —
+    /// used by the PS-editor undo/redo to re-insert a previously deleted layer at its exact prior
+    /// position. The caller is responsible for `z` not colliding with an existing node's (removal
+    /// never renumbers, so an immediate undo re-inserts into a still-free slot). Returns false if the
+    /// page is not resident.
+    pub fn add_node_at_z(&mut self, page_idx: usize, mut node: LayerNode, z: u32) -> bool {
+        let Some(page) = self.pages.get_mut(&page_idx) else {
+            crate::trace_log!(
+                cat::LAYER_MODEL,
+                "add_node_at_z page={} uid={} result=false (page not resident)",
+                page_idx,
+                node.uid
+            );
+            return false;
+        };
+        node.z = z;
+        crate::trace_log!(
+            cat::LAYER_MODEL,
+            "add_node_at_z page={} uid={} kind={:?} z={} count={}",
+            page_idx,
+            node.uid,
+            node.kind,
+            node.z,
+            page.nodes.len() + 1
+        );
+        page.nodes.push(node);
+        page.nodes.sort_by_key(|n| n.z);
+        self.bump_version();
+        true
+    }
+
     /// Removes the node with `uid` from a resident page. Returns whether a node was removed.
     pub fn remove_node(&mut self, page_idx: usize, uid: &str) -> bool {
         let Some(page) = self.pages.get_mut(&page_idx) else {

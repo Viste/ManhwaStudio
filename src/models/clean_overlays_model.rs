@@ -4,7 +4,8 @@ Shared runtime model for clean overlays and action-side page cache.
 
 Main items:
 - `OverlayDelta`: incremental overlay/visibility changes for canvas subscribers.
-- `OverlayHistoryEntry`: one committed overlay edit stored as a minimal rectangular RGBA delta.
+- `CleanOverlayDiffOp`: one committed overlay edit as a reversible tiled+zstd `RasterDiff`
+  (a `ms_actions::ReversibleAction` over `CleanOverlaysModel`).
 - `CleanOverlaysModel`: shared storage for per-page clean overlays and cached source pages.
 
 Core behavior:
@@ -21,16 +22,32 @@ Core behavior:
 - Keeps pages with no clean layer virtual (`None`) and treats fully transparent loaded clean layers
   as absent when they were not user edits, avoiding full transparent CPU images until tools
   materialize the page.
-- Keeps undo/redo history for cleaning commits as per-page signed channel deltas, so history does
-  not duplicate full images and redo branch is discarded after a new head commit.
+- Keeps undo/redo history for cleaning commits via `ms_actions::ActionHistory<CleanOverlayDiffOp>`:
+  each edit is stored as a tiled, zstd-compressed, reversible straight-RGBA delta (`RasterDiff`),
+  bounded by a 128-step count cap AND a per-memory-profile COMPRESSED byte budget; the redo branch
+  is discarded after a new head commit.
 - Supports "cache pages immediately" mode via `cache_pages_enabled`; when disabled, page cache can
   still be populated lazily for specific pages when needed by tools.
+
+Threading note:
+- Undo apply/record works on the straight-RGBA cache and mirrors changed pixels back into the
+  `ColorImage`. Region/brush construction (`replace_region`) is bounded (per-region capture +
+  compress) and cheap enough for the interactive path. The FULL-PAGE construction path
+  (`apply_overlay_snapshot`: clear / quick-clean / large region-editor apply) still scans and
+  zstd-compresses the whole page synchronously on the caller's thread; for those discrete one-shot
+  actions this matches the pre-existing full-page behavior. Moving full-page construction to a
+  worker is a planned follow-up (Phase 2c).
 */
 
 use egui::ColorImage;
 use image::RgbaImage;
+use ms_actions::{
+    ActionHistory, ApplyDirection, DirtyRect, RasterDiff, RasterDiffError, ReversibleAction,
+};
 use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,6 +59,10 @@ use crate::memory_manager::{
 /// Threshold below which LRU eviction of page cache entries is triggered (2 GiB).
 const PAGE_CACHE_EVICT_FREE_RAM_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
 const OVERLAY_HISTORY_LIMIT: usize = 128;
+/// Tile edge (pixels) used to partition overlay `RasterDiff`s. Matches the 1024px
+/// tiling already used elsewhere for dirty-tracking; a local const because the
+/// existing constants are GPU-upload tile sizes not exported for reuse here.
+const OVERLAY_HISTORY_TILE_SIDE: u32 = 1024;
 const DEFAULT_PAGE_CACHE_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const DEFAULT_PAGE_CACHE_ITEM_LIMIT: usize = 64;
 const LOW_PAGE_CACHE_ITEM_LIMIT: usize = 24;
@@ -105,12 +126,89 @@ pub struct OverlayDelta {
     pub changed: Vec<(usize, Option<ColorImage>)>,
 }
 
+/// Error raised while applying a `CleanOverlayDiffOp` to a `CleanOverlaysModel`.
+///
+/// Kept typed and panic-free: a missing/zero-sized target page and a raster
+/// apply failure are the only failure modes, and both are surfaced to the caller
+/// (which treats them as "nothing changed") rather than aborting.
+#[derive(Debug)]
+pub(crate) enum CleanOverlayDiffError {
+    /// The target page index is out of range or has an unknown (zero) size, so the
+    /// diff cannot be applied.
+    PageUnavailable {
+        /// The page index that could not be resolved.
+        page_idx: usize,
+    },
+    /// The underlying `RasterDiff` operation failed (size mismatch, corrupt
+    /// payload, ...).
+    Raster(RasterDiffError),
+}
+
+impl fmt::Display for CleanOverlayDiffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CleanOverlayDiffError::PageUnavailable { page_idx } => {
+                write!(f, "clean overlay page {page_idx} is unavailable for undo/redo")
+            }
+            CleanOverlayDiffError::Raster(err) => write!(f, "raster diff failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for CleanOverlayDiffError {}
+
+impl From<RasterDiffError> for CleanOverlayDiffError {
+    fn from(err: RasterDiffError) -> Self {
+        CleanOverlayDiffError::Raster(err)
+    }
+}
+
+/// One committed clean-overlay edit, stored as a reversible tiled+zstd delta.
+///
+/// The payload lives behind an `Arc` so `inverse()` (used on every undo) and the
+/// redo path share it instead of deep-cloning the compressed tiles. `dir` selects
+/// how [`RasterDiff::apply`] runs: `Forward` re-applies the edit (redo — adds the
+/// delta), `Reverse` undoes it (subtracts the delta). A freshly RECORDED op always
+/// has `dir == Forward`, matching the engine's semantics: `ActionHistory::undo`
+/// runs `inverse()` (a `Reverse` op) to restore the pre-edit pixels, and `redo`
+/// re-applies the original `Forward` op.
 #[derive(Debug, Clone)]
-struct OverlayHistoryEntry {
+pub(crate) struct CleanOverlayDiffOp {
     page_idx: usize,
-    origin_px: [usize; 2],
-    size_px: [usize; 2],
-    rgba_deltas: Vec<[i16; 4]>,
+    diff: Arc<RasterDiff>,
+    dir: ApplyDirection,
+    label: String,
+}
+
+impl ReversibleAction for CleanOverlayDiffOp {
+    type Ctx = CleanOverlaysModel;
+    type Err = CleanOverlayDiffError;
+
+    fn apply(&mut self, ctx: &mut Self::Ctx) -> Result<(), Self::Err> {
+        ctx.apply_raster_diff(self.page_idx, &self.diff, self.dir)
+    }
+
+    fn inverse(&self) -> Self {
+        Self {
+            page_idx: self.page_idx,
+            diff: Arc::clone(&self.diff),
+            dir: match self.dir {
+                ApplyDirection::Forward => ApplyDirection::Reverse,
+                ApplyDirection::Reverse => ApplyDirection::Forward,
+            },
+            label: self.label.clone(),
+        }
+    }
+
+    fn label(&self) -> &str {
+        &self.label
+    }
+
+    fn weight(&self) -> usize {
+        // Drives the history byte budget: the retained cost of this op is its
+        // compressed tile payload (the `Arc`/String overhead is negligible).
+        self.diff.compressed_len()
+    }
 }
 
 #[derive(Debug)]
@@ -133,8 +231,10 @@ pub struct CleanOverlaysModel {
     save_dirty_indexes: HashSet<usize>,
     has_project_unsaved_changes: bool,
     visibility_dirty: bool,
-    undo_history: Vec<OverlayHistoryEntry>,
-    redo_history: Vec<OverlayHistoryEntry>,
+    /// Unified undo/redo engine. Each entry is a reversible tiled+zstd overlay
+    /// delta; bounded by `OVERLAY_HISTORY_LIMIT` steps and a per-profile
+    /// compressed byte budget (see `set_memory_profile`).
+    history: ActionHistory<CleanOverlayDiffOp>,
 }
 
 #[allow(dead_code)]
@@ -171,8 +271,12 @@ impl CleanOverlaysModel {
             save_dirty_indexes: HashSet::new(),
             has_project_unsaved_changes: false,
             visibility_dirty: true,
-            undo_history: Vec::new(),
-            redo_history: Vec::new(),
+            // Start with the count cap and a default (Medium-profile) byte budget;
+            // `set_memory_profile` re-tunes the budget once the profile is known.
+            history: ActionHistory::with_weight_budget(
+                OVERLAY_HISTORY_LIMIT,
+                MemoryBudget::for_profile(MemoryProfile::default()).clean_overlay_undo_bytes_usize(),
+            ),
         }
     }
 
@@ -235,6 +339,10 @@ impl CleanOverlaysModel {
 
     pub fn set_memory_profile(&mut self, profile: MemoryProfile) {
         self.set_page_cache_policy(PageCachePolicy::for_profile(profile, self.page_cache.len()));
+        // Re-tune the undo-history byte budget; enforced immediately (may evict
+        // oldest entries), but always keeps at least one undoable step.
+        let budget = MemoryBudget::for_profile(profile).clean_overlay_undo_bytes_usize();
+        self.history.set_weight_budget(Some(budget));
     }
 
     pub fn set_page_cache_policy(&mut self, policy: PageCachePolicy) {
@@ -604,7 +712,9 @@ impl CleanOverlaysModel {
         }
         let target_w = x1.saturating_sub(x0);
         let target_h = y1.saturating_sub(y0);
-        let history_entry = self.build_region_history_entry(idx, x0, y0, target_w, target_h, chunk);
+        // Capture the region's straight-RGBA pixels BEFORE mutating, so the
+        // recorded diff can be reversed from live pixels (no second snapshot).
+        let before_region = self.copy_region_rgba(idx, x0, y0, target_w, target_h);
         let Some(overlay) = self.overlays.get_mut(idx).and_then(|item| item.as_mut()) else {
             return false;
         };
@@ -618,9 +728,16 @@ impl CleanOverlaysModel {
         };
         let rgba = Arc::make_mut(cache);
         blit_scaled_chunk_rgba(rgba, x0, y0, target_w, target_h, chunk);
-        if let Some(entry) = history_entry {
-            self.push_undo_history(entry);
-        }
+        // Capture "after" from the same region and record the reversible delta.
+        let after_region = self.copy_region_rgba(idx, x0, y0, target_w, target_h);
+        self.record_region_diff(
+            idx,
+            [x0, y0],
+            [target_w, target_h],
+            target_size,
+            &before_region,
+            &after_region,
+        );
         self.mark_dirty(idx);
         true
     }
@@ -745,35 +862,56 @@ impl CleanOverlaysModel {
     }
 
     pub fn can_undo_overlay_history(&self) -> bool {
-        !self.undo_history.is_empty()
+        self.history.can_undo()
     }
 
     pub fn can_redo_overlay_history(&self) -> bool {
-        !self.redo_history.is_empty()
+        self.history.can_redo()
     }
 
     pub fn undo_overlay_history(&mut self) -> bool {
-        let Some(entry) = self.undo_history.pop() else {
-            return false;
-        };
-        if !self.apply_history_entry(&entry, HistoryDirection::Undo) {
-            self.undo_history.push(entry);
-            return false;
+        // Take-and-restore idiom: the ops' `Ctx` is `Self`, but `history` is a
+        // field of `Self`, so `self.history.undo(self)` would double-borrow.
+        // `mem::replace` moves the history out (cheap: it moves a VecDeque of
+        // `Arc<RasterDiff>`, cloning no payloads) against a same-config empty
+        // history, applies against `self`, then puts it back.
+        let mut history = self.take_history();
+        let result = history.undo(self);
+        self.history = history;
+        match result {
+            Ok(changed) => changed,
+            Err(err) => {
+                eprintln!("Clean overlay undo failed: {err}");
+                false
+            }
         }
-        self.redo_history.push(entry);
-        true
     }
 
     pub fn redo_overlay_history(&mut self) -> bool {
-        let Some(entry) = self.redo_history.pop() else {
-            return false;
-        };
-        if !self.apply_history_entry(&entry, HistoryDirection::Redo) {
-            self.redo_history.push(entry);
-            return false;
+        // See `undo_overlay_history` for the take-and-restore rationale.
+        let mut history = self.take_history();
+        let result = history.redo(self);
+        self.history = history;
+        match result {
+            Ok(changed) => changed,
+            Err(err) => {
+                eprintln!("Clean overlay redo failed: {err}");
+                false
+            }
         }
-        self.undo_history.push(entry);
-        true
+    }
+
+    /// Move the undo history out of `self`, leaving an empty history that
+    /// preserves the count limit and byte budget. Used only by the
+    /// take-and-restore undo/redo idiom above; the caller MUST put a history
+    /// back (normally the moved-out one) before returning.
+    fn take_history(&mut self) -> ActionHistory<CleanOverlayDiffOp> {
+        let limit = self.history.limit();
+        let replacement = match self.history.weight_budget() {
+            Some(budget) => ActionHistory::with_weight_budget(limit, budget),
+            None => ActionHistory::new(limit),
+        };
+        mem::replace(&mut self.history, replacement)
     }
 
     pub fn set_visible(&mut self, visible: bool) {
@@ -961,14 +1099,10 @@ impl CleanOverlaysModel {
         rgba_image: Arc<RgbaImage>,
         record_history: bool,
     ) {
-        if record_history
-            && let Some(entry) = self.build_full_image_history_entry(
-                idx,
-                self.overlays.get(idx).and_then(|item| item.as_ref()),
-                &color_image,
-            )
-        {
-            self.push_undo_history(entry);
+        // Record the reversible full-page delta BEFORE overwriting the cache, so
+        // "before" is the current page and "after" is the incoming image.
+        if record_history {
+            self.record_full_image_diff(idx, rgba_image.as_ref());
         }
         self.overlay_rgba_cache[idx] = Some(rgba_image);
         self.overlays[idx] = Some(color_image);
@@ -979,206 +1113,185 @@ impl CleanOverlaysModel {
         }
     }
 
-    fn build_full_image_history_entry(
-        &self,
-        idx: usize,
-        before: Option<&ColorImage>,
-        after: &ColorImage,
-    ) -> Option<OverlayHistoryEntry> {
-        let width = after.size[0];
-        let height = after.size[1];
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let mut min_x = width;
-        let mut min_y = height;
-        let mut max_x = 0usize;
-        let mut max_y = 0usize;
-        let mut changed = false;
-        for y in 0..height {
-            for x in 0..width {
-                let idx_flat = y.saturating_mul(width).saturating_add(x);
-                let before_px = before
-                    .and_then(|image| image.pixels.get(idx_flat))
-                    .copied()
-                    .unwrap_or(egui::Color32::TRANSPARENT);
-                let Some(after_px) = after.pixels.get(idx_flat).copied() else {
-                    continue;
-                };
-                if before_px != after_px {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return None;
-        }
-        let rect_w = max_x.saturating_sub(min_x).saturating_add(1);
-        let rect_h = max_y.saturating_sub(min_y).saturating_add(1);
-        let mut rgba_deltas = Vec::with_capacity(rect_w.saturating_mul(rect_h));
-        for y in min_y..=max_y {
-            for x in min_x..=max_x {
-                let idx_flat = y.saturating_mul(width).saturating_add(x);
-                let before_px = before
-                    .and_then(|image| image.pixels.get(idx_flat))
-                    .copied()
-                    .unwrap_or(egui::Color32::TRANSPARENT);
-                let after_px = after
-                    .pixels
-                    .get(idx_flat)
-                    .copied()
-                    .unwrap_or(egui::Color32::TRANSPARENT);
-                rgba_deltas.push(color_delta(before_px, after_px));
-            }
-        }
-        Some(OverlayHistoryEntry {
-            page_idx: idx,
-            origin_px: [min_x, min_y],
-            size_px: [rect_w, rect_h],
-            rgba_deltas,
-        })
-    }
-
-    fn build_region_history_entry(
-        &self,
-        idx: usize,
-        x: usize,
-        y: usize,
-        width: usize,
-        height: usize,
-        chunk: &ColorImage,
-    ) -> Option<OverlayHistoryEntry> {
-        if width == 0 || height == 0 || chunk.size[0] == 0 || chunk.size[1] == 0 {
-            return None;
-        }
-        let before = self.overlays.get(idx).and_then(|item| item.as_ref());
-        let mut min_x = width;
-        let mut min_y = height;
-        let mut max_x = 0usize;
-        let mut max_y = 0usize;
-        let mut changed = false;
-        for local_y in 0..height {
-            let src_y = (local_y * chunk.size[1] / height).min(chunk.size[1] - 1);
-            for local_x in 0..width {
-                let src_x = (local_x * chunk.size[0] / width).min(chunk.size[0] - 1);
-                let before_px = color_at_or_transparent(before, x + local_x, y + local_y);
-                let after_px = color_at_chunk(chunk, src_x, src_y);
-                if before_px != after_px {
-                    min_x = min_x.min(local_x);
-                    min_y = min_y.min(local_y);
-                    max_x = max_x.max(local_x);
-                    max_y = max_y.max(local_y);
-                    changed = true;
-                }
-            }
-        }
-        if !changed {
-            return None;
-        }
-        let rect_w = max_x.saturating_sub(min_x).saturating_add(1);
-        let rect_h = max_y.saturating_sub(min_y).saturating_add(1);
-        let mut rgba_deltas = Vec::with_capacity(rect_w.saturating_mul(rect_h));
-        for local_y in min_y..=max_y {
-            let src_y = (local_y * chunk.size[1] / height).min(chunk.size[1] - 1);
-            for local_x in min_x..=max_x {
-                let src_x = (local_x * chunk.size[0] / width).min(chunk.size[0] - 1);
-                let before_px = color_at_or_transparent(before, x + local_x, y + local_y);
-                let after_px = color_at_chunk(chunk, src_x, src_y);
-                rgba_deltas.push(color_delta(before_px, after_px));
-            }
-        }
-        Some(OverlayHistoryEntry {
-            page_idx: idx,
-            origin_px: [x + min_x, y + min_y],
-            size_px: [rect_w, rect_h],
-            rgba_deltas,
-        })
-    }
-
-    fn push_undo_history(&mut self, entry: OverlayHistoryEntry) {
-        self.undo_history.push(entry);
-        if self.undo_history.len() > OVERLAY_HISTORY_LIMIT {
-            let overflow = self.undo_history.len() - OVERLAY_HISTORY_LIMIT;
-            self.undo_history.drain(0..overflow);
-        }
-        self.redo_history.clear();
-    }
-
-    fn apply_history_entry(
+    /// Apply a reversible overlay delta to page `page_idx` in `dir`, updating BOTH
+    /// synchronized representations in lockstep. This REPLACES the old
+    /// `apply_history_entry` and is the only mutation path used by undo/redo.
+    ///
+    /// The straight-RGBA cache is the primary buffer the `RasterDiff` mutates; the
+    /// `ColorImage` is then re-derived over the changed rects via
+    /// `Color32::from_rgba_unmultiplied`, keeping the pair byte-consistent under
+    /// the module's straight-vs-premultiplied convention
+    /// (`to_srgba_unmultiplied(ColorImage) == rgba`). Marks the page dirty and
+    /// bumps the revision, exactly as a forward edit does.
+    ///
+    /// # Errors
+    /// - [`CleanOverlayDiffError::PageUnavailable`] if the page is out of range,
+    ///   has zero size, or has no materialized cache.
+    /// - [`CleanOverlayDiffError::Raster`] if the delta cannot be applied (image
+    ///   size mismatch / corrupt payload).
+    fn apply_raster_diff(
         &mut self,
-        entry: &OverlayHistoryEntry,
-        direction: HistoryDirection,
-    ) -> bool {
-        let Some(size) = self.sizes.get(entry.page_idx).copied() else {
-            return false;
+        page_idx: usize,
+        diff: &RasterDiff,
+        dir: ApplyDirection,
+    ) -> Result<(), CleanOverlayDiffError> {
+        let Some(size) = self.sizes.get(page_idx).copied() else {
+            return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
         };
         if size[0] == 0 || size[1] == 0 {
-            return false;
+            return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
         }
-        self.ensure_overlay_storage(entry.page_idx, size);
+        // Guarantee both representations exist at the page size before applying.
+        self.ensure_overlay_storage(page_idx, size);
+        let Some(image_size) = usize_pair_to_u32(size) else {
+            return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
+        };
+
+        // 1) Apply the delta to the straight-RGBA cache (primary buffer). A page
+        //    resized since the edit surfaces as a `RasterDiff` size error here.
+        let dirty = {
+            let Some(cache) = self
+                .overlay_rgba_cache
+                .get_mut(page_idx)
+                .and_then(|item| item.as_mut())
+            else {
+                return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
+            };
+            let rgba = Arc::make_mut(cache);
+            diff.apply(rgba.as_mut(), image_size, dir)?
+        };
+
+        // 2) Mirror the changed pixels into the ColorImage. `overlay_rgba_cache`
+        //    (read) and `overlays` (write) are DIFFERENT fields, so these disjoint
+        //    borrows coexist.
+        let Some(rgba) = self
+            .overlay_rgba_cache
+            .get(page_idx)
+            .and_then(|item| item.as_ref())
+        else {
+            return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
+        };
         let Some(overlay) = self
             .overlays
-            .get_mut(entry.page_idx)
+            .get_mut(page_idx)
             .and_then(|item| item.as_mut())
         else {
-            return false;
+            return Err(CleanOverlayDiffError::PageUnavailable { page_idx });
         };
-        let Some(cache) = self
-            .overlay_rgba_cache
-            .get_mut(entry.page_idx)
-            .and_then(|item| item.as_mut())
-        else {
-            return false;
+        sync_color_image_from_rgba(overlay, rgba.as_ref(), &dirty);
+
+        self.mark_dirty(page_idx);
+        Ok(())
+    }
+
+    /// Copy a region's straight-RGBA pixels out of the page cache, row-major over
+    /// the `w`x`h` rect at `(x, y)`. Out-of-bounds or missing pixels read as fully
+    /// transparent (zeros), matching the old delta's TRANSPARENT default.
+    fn copy_region_rgba(&self, idx: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let mut out = vec![0u8; w.saturating_mul(h).saturating_mul(4)];
+        let Some(image) = self.overlay_rgba_cache.get(idx).and_then(|item| item.as_ref()) else {
+            return out;
         };
-        let rect_w = entry.size_px[0];
-        let rect_h = entry.size_px[1];
-        if rect_w == 0 || rect_h == 0 {
-            return false;
-        }
-        let expected_len = rect_w.saturating_mul(rect_h);
-        if entry.rgba_deltas.len() != expected_len {
-            return false;
-        }
-        let overlay_w = overlay.size[0];
-        let overlay_h = overlay.size[1];
-        let raw = Arc::make_mut(cache).as_mut();
-        for local_y in 0..rect_h {
-            for local_x in 0..rect_w {
-                let dst_x = entry.origin_px[0] + local_x;
-                let dst_y = entry.origin_px[1] + local_y;
-                if dst_x >= overlay_w || dst_y >= overlay_h {
-                    return false;
+        let img_w = image.width() as usize;
+        let img_h = image.height() as usize;
+        let raw = image.as_raw();
+        for row in 0..h {
+            let src_y = y + row;
+            if src_y >= img_h {
+                break;
+            }
+            for col in 0..w {
+                let src_x = x + col;
+                if src_x >= img_w {
+                    break;
                 }
-                let delta_idx = local_y.saturating_mul(rect_w).saturating_add(local_x);
-                let Some(delta) = entry.rgba_deltas.get(delta_idx).copied() else {
-                    return false;
-                };
-                let pixel_idx = dst_y.saturating_mul(overlay_w).saturating_add(dst_x);
-                let Some(pixel) = overlay.pixels.get_mut(pixel_idx) else {
-                    return false;
-                };
-                let raw_idx = pixel_idx.saturating_mul(4);
-                if raw_idx.saturating_add(3) >= raw.len() {
-                    return false;
+                let src_idx = (src_y * img_w + src_x) * 4;
+                let dst_idx = (row * w + col) * 4;
+                if let (Some(src), Some(dst)) = (
+                    raw.get(src_idx..src_idx + 4),
+                    out.get_mut(dst_idx..dst_idx + 4),
+                ) {
+                    dst.copy_from_slice(src);
                 }
-                let next = apply_color_delta(*pixel, delta, direction);
-                *pixel = next;
-                write_color32_as_straight_rgba(raw, raw_idx, next);
             }
         }
-        self.mark_dirty(entry.page_idx);
-        true
+        out
     }
-}
 
-#[derive(Clone, Copy)]
-enum HistoryDirection {
-    Undo,
-    Redo,
+    /// Build and record a region overlay delta from region-local `before`/`after`
+    /// straight-RGBA buffers. Skips recording when nothing changed (no-op edit) so
+    /// `can_undo` stays false, matching the previous behavior.
+    fn record_region_diff(
+        &mut self,
+        idx: usize,
+        region_origin: [usize; 2],
+        region_size: [usize; 2],
+        image_size: [usize; 2],
+        before: &[u8],
+        after: &[u8],
+    ) {
+        let (Some(origin), Some(region), Some(dims)) = (
+            usize_pair_to_u32(region_origin),
+            usize_pair_to_u32(region_size),
+            usize_pair_to_u32(image_size),
+        ) else {
+            return;
+        };
+        match RasterDiff::from_region_pixels(
+            before,
+            after,
+            origin,
+            region,
+            dims,
+            OVERLAY_HISTORY_TILE_SIDE,
+        ) {
+            Ok(diff) if diff.is_empty() => {}
+            Ok(diff) => self.history.record(CleanOverlayDiffOp {
+                page_idx: idx,
+                diff: Arc::new(diff),
+                dir: ApplyDirection::Forward,
+                label: overlay_edit_label(),
+            }),
+            Err(err) => {
+                eprintln!("Failed to build region clean overlay undo diff (page {idx}): {err}");
+            }
+        }
+    }
+
+    /// Build and record a full-page overlay delta between the current page cache
+    /// and the incoming `after` image. Skips recording when nothing changed.
+    fn record_full_image_diff(&mut self, idx: usize, after: &RgbaImage) {
+        let w = after.width();
+        let h = after.height();
+        if w == 0 || h == 0 {
+            return;
+        }
+        let after_bytes = after.as_raw();
+        // "Before" is the current straight-RGBA page; a missing or mismatched page
+        // is treated as fully transparent (parity with the old delta which
+        // defaulted absent pixels to TRANSPARENT).
+        let fallback: Vec<u8>;
+        let before_bytes: &[u8] =
+            match self.overlay_rgba_cache.get(idx).and_then(|item| item.as_ref()) {
+                Some(image) if image.width() == w && image.height() == h => image.as_raw(),
+                _ => {
+                    fallback = vec![0u8; after_bytes.len()];
+                    &fallback
+                }
+            };
+        match RasterDiff::from_rgba(before_bytes, after_bytes, [w, h], OVERLAY_HISTORY_TILE_SIDE) {
+            Ok(diff) if diff.is_empty() => {}
+            Ok(diff) => self.history.record(CleanOverlayDiffOp {
+                page_idx: idx,
+                diff: Arc::new(diff),
+                dir: ApplyDirection::Forward,
+                label: overlay_edit_label(),
+            }),
+            Err(err) => {
+                eprintln!("Failed to build full-page clean overlay undo diff (page {idx}): {err}");
+            }
+        }
+    }
 }
 
 fn numeric_first_key(path: &Path) -> (u8, String, u8, String) {
@@ -1268,60 +1381,62 @@ fn write_color32_as_straight_rgba(raw: &mut [u8], raw_idx: usize, color: egui::C
     raw[raw_idx + 3] = a;
 }
 
-fn color_at_or_transparent(image: Option<&ColorImage>, x: usize, y: usize) -> egui::Color32 {
-    let Some(image) = image else {
-        return egui::Color32::TRANSPARENT;
-    };
-    if x >= image.size[0] || y >= image.size[1] {
-        return egui::Color32::TRANSPARENT;
+/// Convert a `[usize; 2]` pixel pair into a `[u32; 2]`, or `None` if either
+/// component exceeds `u32` (unreachable for realistic image dimensions). Keeps the
+/// raster-diff conversions free of lossy `as` casts.
+fn usize_pair_to_u32(pair: [usize; 2]) -> Option<[u32; 2]> {
+    Some([
+        u32::try_from(pair[0]).ok()?,
+        u32::try_from(pair[1]).ok()?,
+    ])
+}
+
+/// Fixed label for clean-overlay undo entries (not currently surfaced in the UI;
+/// present for history/logging parity with the unified action system).
+fn overlay_edit_label() -> String {
+    "clean overlay edit".to_string()
+}
+
+/// Re-derive the `ColorImage` pixels over the changed `dirty` rects from the
+/// straight-RGBA cache, keeping the two representations byte-consistent.
+///
+/// Uses `Color32::from_rgba_unmultiplied`, the inverse of the
+/// `to_srgba_unmultiplied` used to build the RGBA cache, so
+/// `to_srgba_unmultiplied(result) == rgba` holds for every synced pixel (the
+/// module's dual-representation invariant). Out-of-bounds rects are clamped, never
+/// panicking.
+fn sync_color_image_from_rgba(overlay: &mut ColorImage, rgba: &RgbaImage, dirty: &[DirtyRect]) {
+    let ow = overlay.size[0];
+    let oh = overlay.size[1];
+    let iw = rgba.width() as usize;
+    let ih = rgba.height() as usize;
+    let raw = rgba.as_raw();
+    for rect in dirty {
+        let ox = rect.origin_px[0] as usize;
+        let oy = rect.origin_px[1] as usize;
+        let rw = rect.size_px[0] as usize;
+        let rh = rect.size_px[1] as usize;
+        for row in 0..rh {
+            let y = oy + row;
+            if y >= oh || y >= ih {
+                break;
+            }
+            for col in 0..rw {
+                let x = ox + col;
+                if x >= ow || x >= iw {
+                    break;
+                }
+                let src_idx = (y * iw + x) * 4;
+                let Some(px) = raw.get(src_idx..src_idx + 4) else {
+                    continue;
+                };
+                let color = egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]);
+                if let Some(dst) = overlay.pixels.get_mut(y * ow + x) {
+                    *dst = color;
+                }
+            }
+        }
     }
-    let idx = y.saturating_mul(image.size[0]).saturating_add(x);
-    image
-        .pixels
-        .get(idx)
-        .copied()
-        .unwrap_or(egui::Color32::TRANSPARENT)
-}
-
-fn color_at_chunk(image: &ColorImage, x: usize, y: usize) -> egui::Color32 {
-    let idx = y.saturating_mul(image.size[0]).saturating_add(x);
-    image
-        .pixels
-        .get(idx)
-        .copied()
-        .unwrap_or(egui::Color32::TRANSPARENT)
-}
-
-fn color_delta(before: egui::Color32, after: egui::Color32) -> [i16; 4] {
-    [
-        i16::from(after.r()) - i16::from(before.r()),
-        i16::from(after.g()) - i16::from(before.g()),
-        i16::from(after.b()) - i16::from(before.b()),
-        i16::from(after.a()) - i16::from(before.a()),
-    ]
-}
-
-fn apply_color_delta(
-    color: egui::Color32,
-    delta: [i16; 4],
-    direction: HistoryDirection,
-) -> egui::Color32 {
-    let sign = match direction {
-        HistoryDirection::Undo => -1,
-        HistoryDirection::Redo => 1,
-    };
-    egui::Color32::from_rgba_premultiplied(
-        apply_channel_delta(color.r(), delta[0], sign),
-        apply_channel_delta(color.g(), delta[1], sign),
-        apply_channel_delta(color.b(), delta[2], sign),
-        apply_channel_delta(color.a(), delta[3], sign),
-    )
-}
-
-fn apply_channel_delta(channel: u8, delta: i16, sign: i16) -> u8 {
-    let value = i16::from(channel) + delta.saturating_mul(sign);
-    let clamped = value.clamp(0, i16::from(u8::MAX));
-    u8::try_from(clamped).unwrap_or(u8::MAX)
 }
 
 fn blit_scaled_chunk_color_image(
@@ -1534,6 +1649,121 @@ mod tests {
             panic!("overlay rgba cache was not populated");
         };
         assert_eq!(rgba.as_raw().as_slice(), &[255, 255, 255, 128]);
+    }
+
+    fn solid_chunk(r: u8, g: u8, b: u8, a: u8) -> ColorImage {
+        ColorImage::filled([1, 1], egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+    }
+
+    #[test]
+    fn region_edit_syncs_both_reps_and_round_trips() {
+        let mut model = single_page_model();
+        let chunk = solid_chunk(255, 255, 255, 255);
+        assert!(model.get(0).is_none());
+
+        // Forward edit mutates BOTH representations.
+        assert!(model.replace_region(0, [2, 2], 0, 0, 1, 1, &chunk));
+        let Some(color) = model.get(0) else {
+            panic!("overlay color image was not populated");
+        };
+        assert_eq!(color.pixels[0].to_srgba_unmultiplied(), [255, 255, 255, 255]);
+        let Some(rgba) = model.overlay_rgba(0) else {
+            panic!("overlay rgba cache was not populated");
+        };
+        assert_eq!(&rgba.as_raw()[0..4], &[255, 255, 255, 255]);
+        assert!(model.can_undo_overlay_history());
+
+        // Undo restores BOTH to the pre-edit transparent pixels.
+        assert!(model.undo_overlay_history());
+        let Some(color) = model.get(0) else {
+            panic!("overlay color image missing after undo");
+        };
+        assert_eq!(color.pixels[0], egui::Color32::TRANSPARENT);
+        let Some(rgba) = model.overlay_rgba(0) else {
+            panic!("overlay rgba cache missing after undo");
+        };
+        assert_eq!(&rgba.as_raw()[0..4], &[0, 0, 0, 0]);
+
+        // Redo restores BOTH to the post-edit pixels.
+        assert!(model.redo_overlay_history());
+        let Some(color) = model.get(0) else {
+            panic!("overlay color image missing after redo");
+        };
+        assert_eq!(color.pixels[0].to_srgba_unmultiplied(), [255, 255, 255, 255]);
+        let Some(rgba) = model.overlay_rgba(0) else {
+            panic!("overlay rgba cache missing after redo");
+        };
+        assert_eq!(&rgba.as_raw()[0..4], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn full_replace_snapshot_round_trips_both_reps() {
+        let mut model = single_page_model();
+        let mut white = RgbaImage::new(2, 2);
+        for px in white.pixels_mut() {
+            *px = image::Rgba([255, 255, 255, 255]);
+        }
+        model.replace_from_rgba(0, white);
+        assert!(model.can_undo_overlay_history());
+
+        assert!(model.undo_overlay_history());
+        let Some(rgba) = model.overlay_rgba(0) else {
+            panic!("overlay rgba cache missing after undo");
+        };
+        assert!(rgba.as_raw().iter().all(|&b| b == 0));
+        let Some(color) = model.get(0) else {
+            panic!("overlay color image missing after undo");
+        };
+        assert!(color.pixels.iter().all(|px| *px == egui::Color32::TRANSPARENT));
+
+        assert!(model.redo_overlay_history());
+        let Some(rgba) = model.overlay_rgba(0) else {
+            panic!("overlay rgba cache missing after redo");
+        };
+        assert!(rgba.as_raw().iter().all(|&b| b == 255));
+    }
+
+    #[test]
+    fn identical_region_edit_is_not_recorded() {
+        let mut model = single_page_model();
+        assert!(model.ensure_overlay(0, [2, 2]));
+        let transparent = ColorImage::filled([2, 2], egui::Color32::TRANSPARENT);
+        // Overwriting transparent with transparent changes nothing.
+        assert!(model.replace_region(0, [2, 2], 0, 0, 2, 2, &transparent));
+        assert!(!model.can_undo_overlay_history());
+    }
+
+    #[test]
+    fn new_edit_truncates_redo_branch() {
+        let mut model = single_page_model();
+        let a = solid_chunk(255, 0, 0, 255);
+        let b = solid_chunk(0, 255, 0, 255);
+        let c = solid_chunk(0, 0, 255, 255);
+        assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &a));
+        assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &b));
+        assert!(model.undo_overlay_history());
+        assert!(model.can_redo_overlay_history());
+        // A fresh commit abandons the redoable future.
+        assert!(model.replace_region(0, [4, 4], 1, 1, 1, 1, &c));
+        assert!(!model.can_redo_overlay_history());
+    }
+
+    #[test]
+    fn tiny_weight_budget_evicts_oldest_but_keeps_one() {
+        let mut model = single_page_model();
+        // A budget far below any single compressed diff exercises eviction while
+        // the `len > 1` guard keeps the newest step undoable.
+        model.history.set_weight_budget(Some(4));
+        for color in [
+            solid_chunk(255, 0, 0, 255),
+            solid_chunk(0, 255, 0, 255),
+            solid_chunk(0, 0, 255, 255),
+        ] {
+            assert!(model.replace_region(0, [4, 4], 0, 0, 1, 1, &color));
+        }
+        assert!(model.can_undo_overlay_history());
+        assert_eq!(model.history.undo_len(), 1);
+        assert!(model.history.undo_weight() > 4);
     }
 
     #[test]

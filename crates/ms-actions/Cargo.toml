@@ -1,0 +1,20 @@
+[package]
+name = "ms-actions"
+version = "0.1.0"
+edition = "2024"
+
+# Generic, GUI-free undo/redo engine for ManhwaStudio.
+# Pure std by default: no egui/eframe/tokio/image and no dependency on the
+# application crate or any domain type. Concrete domain Ops live in the main crate
+# (later phases). The optional `raster` feature adds the domain-agnostic
+# `RasterDiff` primitive and its only extra dependency, `zstd`.
+[dependencies]
+# Only pulled in when the `raster` feature is enabled; keeps the default build
+# std-only. Version matches the workspace root (0.13).
+zstd = { version = "0.13", optional = true }
+
+[features]
+# Enables the `raster_diff` module: a tiled, zstd-compressed, reversible RGBA
+# delta primitive. Gated so bubble/field consumers never pull image/compression
+# deps.
+raster = ["dep:zstd"]

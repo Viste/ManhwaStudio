@@ -3294,6 +3294,7 @@ dependencies = [
  "libc",
  "libloading",
  "minijinja",
+ "ms-actions",
  "ms-log",
  "ms-text-render",
  "ms-text-util",
@@ -3437,6 +3438,13 @@ checksum = "ac9557c559cd6fc9867e122e20d2cbefc9ca29d80d027a8e39310920ed2f0a97"
 dependencies = [
  "num-traits",
  "pxfm",
+]
+
+[[package]]
+name = "ms-actions"
+version = "0.1.0"
+dependencies = [
+ "zstd",
 ]
 
 [[package]]

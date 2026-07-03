@@ -165,6 +165,61 @@ impl MemoryBudget {
             },
         }
     }
+
+    /// Total-bytes budget for the clean-overlay undo history, in COMPRESSED
+    /// (zstd) bytes, scaled by the active memory profile.
+    ///
+    /// This bounds the sum of retained `RasterDiff` payloads on the undo stack
+    /// (see `CleanOverlaysModel`). It is independent of the source-page cache
+    /// budget: undo history is user-editable state, not a reconstructable cache,
+    /// so it gets its own cap. A single edit larger than the whole budget is
+    /// still retained (there is always at least one undoable step), so this is a
+    /// soft target for the accumulated history rather than a hard per-edit limit.
+    #[must_use]
+    pub fn clean_overlay_undo_bytes(self) -> u64 {
+        match self.profile {
+            MemoryProfile::Minimal => 64 * MIB,
+            MemoryProfile::Low => 128 * MIB,
+            MemoryProfile::Medium => 256 * MIB,
+            MemoryProfile::Maximum => 512 * MIB,
+        }
+    }
+
+    /// [`Self::clean_overlay_undo_bytes`] as `usize` for the history engine's
+    /// budget API. Saturates to `usize::MAX` on the (unreachable for these small
+    /// caps) 32-bit overflow, never panicking.
+    #[must_use]
+    pub fn clean_overlay_undo_bytes_usize(self) -> usize {
+        usize::try_from(self.clean_overlay_undo_bytes()).unwrap_or(usize::MAX)
+    }
+
+    /// Total-bytes budget for the PS-editor per-page undo history, in COMPRESSED
+    /// (zstd) bytes, scaled by the active memory profile.
+    ///
+    /// Bounds the sum of retained `RasterDiff` payloads on the PS editor's brush
+    /// undo stack (see `tabs::ps_editor::edit_op`). Sibling of
+    /// [`Self::clean_overlay_undo_bytes`] and uses the same tiers: undo history is
+    /// user-editable state, not a reconstructable cache, so it gets its own cap. A
+    /// single edit larger than the whole budget is still retained (there is always
+    /// at least one undoable step), so this is a soft target for the accumulated
+    /// history rather than a hard per-edit limit.
+    #[must_use]
+    pub fn ps_editor_undo_bytes(self) -> u64 {
+        match self.profile {
+            MemoryProfile::Minimal => 64 * MIB,
+            MemoryProfile::Low => 128 * MIB,
+            MemoryProfile::Medium => 256 * MIB,
+            MemoryProfile::Maximum => 512 * MIB,
+        }
+    }
+
+    /// [`Self::ps_editor_undo_bytes`] as `usize` for the history engine's budget
+    /// API. Saturates to `usize::MAX` on the (unreachable for these small caps)
+    /// 32-bit overflow, never panicking.
+    #[must_use]
+    pub fn ps_editor_undo_bytes_usize(self) -> usize {
+        usize::try_from(self.ps_editor_undo_bytes()).unwrap_or(usize::MAX)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

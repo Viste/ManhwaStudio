@@ -53,8 +53,17 @@ to refresh local mask caches.
   `width * height`.
 - PNG/export-facing clean overlay buffers must be straight-alpha RGBA. Convert from
   `Color32` with `to_srgba_unmultiplied()` before writing to `RgbaImage`.
-- Undo/redo deltas for clean overlays operate on `Color32`'s internal representation,
-  while the save/export cache must be updated with straight-alpha RGBA after each delta.
+- Undo/redo for clean overlays uses `ms_actions::ActionHistory<CleanOverlayDiffOp>`: each committed
+  edit is a tiled, zstd-compressed, reversible straight-RGBA `RasterDiff`, bounded by a 128-step
+  count cap AND a per-memory-profile COMPRESSED byte budget (`MemoryBudget::clean_overlay_undo_bytes`,
+  pushed via `set_memory_profile`). Applying a diff (`apply_raster_diff`) mutates the straight-RGBA
+  cache first, then re-derives the `ColorImage` over the changed rects with `from_rgba_unmultiplied`
+  so both representations stay byte-consistent. Region/brush construction is bounded and runs inline;
+  the full-page construction path (`apply_overlay_snapshot`: clear / quick-clean / large region apply)
+  still scans+compresses synchronously on the caller's thread (parity with prior behavior; off-thread
+  is a planned Phase 2c follow-up). Because `RasterDiff` works in straight-alpha space, a synced
+  `ColorImage` pixel can differ from a directly-blitted one by at most premultiplication rounding for
+  partial alpha; the save/export RGBA cache is bit-exact.
 - Page cache eviction and population must not make canvas/export results depend on whether caching
   is enabled; it is a performance cache only.
 - Decoded source-page cache entries are always clean and reconstructable from page files; memory

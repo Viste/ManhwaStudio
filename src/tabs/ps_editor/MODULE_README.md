@@ -135,6 +135,73 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
 - `layer_render.rs`: `TiledTexture` — per-layer tile grid (sized to the layer image), dirty
   tracking, budgeted upload, and transform-aware mesh draw.
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
+- `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
+  `ReversibleAction<Ctx = PsEditorTabState>` with three variants (real `match`, no `_ =>`, so every
+  variant is handled everywhere): `RasterPixels` (brush stroke as a tiled+zstd `RasterDiff`, Part A),
+  `LayerLifecycle` (add/delete a whole raster layer, retaining `Box<Layer>` + its `z` for re-add), and
+  `FieldPatch` (one metadata/geometry field — `LayerFieldPatch::{Visibility,Opacity,Transform,Deform}`
+  — carrying `before` + `after`). Pure, GUI-free cores unit-tested here: `apply_raster_diff_to_layer`
+  (diff → `Layer.image` + `base_image` mirror), `copy_region_premul` (region-local buffer), and
+  `apply_field_patch_to_layer` (drives a `Layer` field to a patch's `after`; also the no-doc fallback).
+
+## Undo/redo (brush strokes + structural/metadata ops)
+- The tab owns a per-page `ActionHistory<PsEditOp>` (`history`) bounded by `PS_EDITOR_UNDO_LIMIT`
+  steps AND a compressed byte budget (`MemoryBudget::ps_editor_undo_bytes`). No live `MemoryProfile`
+  handle is wired into this tab yet, so a fixed Medium-profile cap is used; a profile-driven budget is
+  a follow-up.
+- **Per-page-session scope**: the history is CLEARED on every page switch (`request_page`, after
+  `persist_current_page`). A recorded diff is only valid while its page's layer image buffers are
+  resident, and each page rebuilds the stack from scratch, so cross-page undo is intentionally not
+  attempted here.
+- **"Before" comes for free from `base_image`**: during a brush stroke `paint_line_color` mutates only
+  `layer.image`; `base_image` keeps the pre-stroke pixels until the release commit. So at the commit
+  site `record_brush_stroke` builds the reversible diff from `base_image` (before) vs `image` (after)
+  over the stroke's accumulated dirty union (`brush_stroke_dirty`), avoiding any stroke-start snapshot
+  of the (up to ~800×19000) ribbon image. `record` is observer-style (the forward edit was already
+  applied live) — it never re-applies the paint.
+- **Alpha convention**: diffs are built from and applied to the PREMULTIPLIED `Color32` bytes directly
+  (`ColorImage::as_raw`/`as_raw_mut`), consistently for build and apply. No separate straight-alpha
+  buffer exists here (unlike the clean-overlay model). The signed-delta round-trip is correct for any
+  consistent RGBA8 buffer.
+- Apply path (`apply_ps_raster_edit`): finds the resident raster by uid on the matching page, mutates
+  `image` + `base_image`, marks only the touched `render_cache` tiles dirty, and routes the reverted
+  pixels to the shared doc via `set_raster_pixels` (same path as forward edits) so cross-tab consumers
+  and the next `sync_view_from_doc` reprojection agree.
+  The `history` field holds ops whose `Ctx` is the whole tab, so `undo`/`redo` use the clean-model
+  take-and-restore idiom (`take_history` + unconditional restore) to avoid a self-borrow.
+- **Direction convention** (uniform across variants): `apply` always drives toward the op's RECORDED
+  end state — a `FieldPatch` applies its `after`; a `LayerLifecycle` realizes its `dir` (`Added` ⇒
+  present, `Removed` ⇒ absent). `inverse()` swaps a `FieldPatch`'s before/after and flips a
+  `LayerLifecycle`'s dir. So `record` pushes the forward op as-is (the mutation already happened live),
+  `undo` runs `inverse()`, `redo` re-runs the original — matching the engine's Koharu-style contract.
+- **Structural apply** (`apply_ps_layer_lifecycle`): `Added` rebuilds the doc node from the retained
+  `Layer` (`pixels_dirty=true` so the pruned base PNG is rewritten; preserves the deform mesh) and
+  `add_node_at_z`s it at the captured Z; `Removed` `remove_node`s by uid. Both update
+  `deleted_raster_uids` (so the next persist drops/keeps the on-disk PNG) then `sync_view_from_doc`
+  rebuilds the stack + prunes/creates the `render_cache` — the SAME projection the forward add/delete
+  paths use.
+- **Metadata apply** (`apply_ps_field_patch`): drives the doc setter
+  (`set_visibility`/`set_opacity`/`set_transform`/`set_deform`) to `after` then `edit_doc_node`
+  re-projects (no `render_cache` invalidation — these fields don't change pixels, compositing re-reads
+  them each frame); falls back to `apply_field_patch_to_layer` on the stack when no doc page is
+  resident.
+- **Persistence tail** (`finish_history_step`): on a real change, calls `persist_current_page` (reads
+  the reconciled `self.stack`, carries the explicit `removed_uids`, PNG encode off-thread) — NOT a bare
+  doc enqueue — because a lifecycle delete/undo must drop or keep the on-disk raster correctly (the
+  doc's own `enqueue_page_save` passes an empty removed set and would resurrect a deleted raster).
+- **Recording sites** (observer style, `history.record` AFTER the live mutation; skip if unchanged):
+  add-layer + delete-layer in `apply_panel_actions` (`LayerLifecycle`); visibility toggle there
+  (`FieldPatch::Visibility`); opacity SLIDER recorded ONCE per drag gesture via `opacity_gesture`
+  (snapshot pre-drag value on the first change, record on the first idle frame); transform/deform
+  recorded ONCE per pointer gesture via `transform_gesture_before` / `deform_gesture_before` (snapshot
+  at press, record at release if the same layer actually changed). All three gesture snapshots are
+  cleared on page switch.
+- **Not yet undoable** (deferred): cut/clip, merge-down (need a Batch op — a later part), and z-reorder
+  / grouping (`move_band_one` / `apply_group_op` write the band order to disk synchronously with a
+  "band order written LAST" requirement that the unified persist tail cannot reproduce without a
+  dedicated per-op persistence hook). Rename has no UI, so no `LayerFieldPatch::Name`.
+- Hotkeys (`handle_hotkeys`): Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y = redo (respecting the
+  existing focus early-return). `handle_hotkeys` takes `&ProjectData` so undo/redo can persist.
 
 ## Contracts and invariants
 - GUI thread never decodes images or holds the model lock across decode: that is `page_loader`'s

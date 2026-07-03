@@ -21,7 +21,6 @@ Main types:
 - `AsideDragTarget`: source of active aside drag (`BubbleBody` or `RectArea`).
 - `AsideDragState`: runtime state of active aside drag (`bid`, source target, last pointer pos, moved flag).
 - `OnTopDragState`: runtime state of active on-top move-handle drag (`bid`, last pointer pos, moved flag).
-- `BubbleHistoryEntry`: one global undo/redo snapshot for all bubbles.
 - `BubbleLink`: geometry for anchor line from bubble to image point.
 - Source page textures are optional GPU residency: page geometry comes from `PageImageInfo`, while
   source tile LINEAR/NEAREST handles may be dropped and recreated from decoded tile bytes.
@@ -56,7 +55,7 @@ Key constants:
   on-top palm move-handle drawn above the bubble rect.
 - `DEFAULT_BUBBLE_RECT_SIDE_SRC_PX`: default bubble rectangle side in source pixels.
 - `LEGACY_DEFAULT_RECT_DELTA_UV`: fallback UV span for legacy bubbles without rect coords.
-- `BUBBLE_HISTORY_LIMIT`: max undo/redo depth for full-bubble snapshots.
+- `BUBBLE_HISTORY_LIMIT`: max undo/redo depth of the bubble `ms-actions` history.
 - `BUBBLE_ANCHOR_OUTSIDE_RECT_SPAN_MULT`: max anchor overshoot outside rect in multiples of rect span.
 
 CanvasHooks methods:
@@ -171,7 +170,7 @@ Module-level utility functions:
 
 Key CanvasView state groups (important fields):
 - Bubble runtime/edit state: `runtime_bubbles`, `selected_bubble`, `move_active_bid`,
-  `active_rect_handle`, `aside_drag_state`, `bubble_undo_stack`, `bubble_redo_stack`,
+  `active_rect_handle`, `aside_drag_state`, `bubble_history`, `pending_history_before`,
   `pending_*`, `focused_bubbles`, `deferred_remote_*`, `canvas_context_menu_target`.
 - Page/view state: `page_rects`, `scroll_center_idx`, `scroll_offset`, `visible_scene_rect`,
   `scroll_inner_rect`, `pending_zoom_anchor`, `pending_scroll_offset`.
@@ -228,6 +227,7 @@ pub(crate) const BUBBLE_ORIGINAL_SPELLCHECK_DISABLED_KEY: &str = "spellcheck_ori
 pub(crate) const BUBBLE_TRANSLATION_SPELLCHECK_DISABLED_KEY: &str =
     "spellcheck_translation_disabled";
 
+mod bubble_action;
 mod bubble_aside_ui;
 mod bubble_on_top_ui;
 mod bubble_runtime;

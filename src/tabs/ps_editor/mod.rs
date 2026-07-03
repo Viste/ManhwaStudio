@@ -28,6 +28,7 @@ Base layers mirror existing models read-only and are never written back. User ra
 session-scoped in memory (kept per page); on-disk persistence is a future phase.
 */
 
+pub mod edit_op;
 pub mod layer_render;
 pub mod layers;
 pub mod page_loader;
@@ -37,6 +38,7 @@ pub mod tools;
 pub mod tree;
 pub mod viewport;
 
+use crate::memory_manager::{MemoryBudget, MemoryProfile};
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::models::layer_model::effects;
 use crate::models::layer_model::manifest::TransformRec;
@@ -45,9 +47,11 @@ use crate::models::layer_model::persist;
 use crate::models::layer_model::saver;
 use crate::project::ProjectData;
 use crate::trace::cat;
+use edit_op::{LayerFieldPatch, LifecycleDir, PsEditOp};
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 use layer_render::TiledTexture;
+use ms_actions::{ActionHistory, ApplyDirection, RasterDiff};
 use layers::{GroupId, Layer, LayerGroup, LayerId, LayerKind, LayerStack, LayerTransform};
 use page_loader::{PageLoadRequest, PageLoaderHandles, spawn_page_loader_thread};
 use selection::{Selection, SelectionBounds};
@@ -64,6 +68,13 @@ use tools::{PsTool, PsToolContext, PsToolId, ToolOutcome};
 
 /// Max layer tiles uploaded to the GPU per frame across all layers (spreads big-page uploads).
 const TILE_UPLOAD_BUDGET_PER_FRAME: usize = 8;
+
+/// Max undo steps retained by the PS-editor per-page history (in addition to the byte budget).
+const PS_EDITOR_UNDO_LIMIT: usize = 128;
+
+/// Tile edge (px) used to partition PS-editor undo `RasterDiff`s. Matches the 1024px tiling used by
+/// `layer_render::TiledTexture` and the clean-overlay history.
+const PS_UNDO_TILE_SIDE: u32 = 1024;
 
 /// Number of text characters shown in a text-layer row preview (`Текст (preview)`) in the layers
 /// panel. Fixed budget (the typing tab makes this width-adaptive; a constant is enough here).
@@ -159,6 +170,25 @@ pub struct PsEditorTabState {
     /// requested effects are never silently dropped (e.g. effecting a second raster right after a
     /// first). Mirrors the typing tab's `pending_raster_effects`.
     pending_raster_effects: Option<PendingPsRasterEffects>,
+    /// Per-page undo/redo engine (Phase 3a). Each entry is a reversible tiled+zstd raster delta. The
+    /// history is PER-PAGE-SESSION: it is cleared on every page switch (`request_page`) because a diff
+    /// is only valid while its page's layer image buffers are resident. Bounded by
+    /// `PS_EDITOR_UNDO_LIMIT` steps and a per-memory-profile COMPRESSED byte budget.
+    history: ActionHistory<PsEditOp>,
+    /// Accumulated union of the active brush stroke's per-segment dirty rects (layer-local px,
+    /// inclusive). Reset on the stroke's press frame and consumed at release to build a region-bounded
+    /// undo diff. `None` when no stroke is in progress or nothing was painted.
+    brush_stroke_dirty: Option<tools::DirtyRect>,
+    /// Active opacity-slider gesture: `(raster LayerId, opacity BEFORE the drag)`. Set on the first
+    /// slider change of a drag, consumed one undo entry per completed gesture (the first idle frame
+    /// with no further opacity change), so a drag records a single reversible step, not one per tick.
+    opacity_gesture: Option<(LayerId, f32)>,
+    /// Transform-tool gesture start snapshot: `(raster uid, transform BEFORE the gesture)`. Captured on
+    /// the press frame and consumed at release to record ONE `FieldPatch::Transform` per gesture.
+    transform_gesture_before: Option<(String, LayerTransform)>,
+    /// Deform-tool gesture start snapshot: `(raster uid, deform BEFORE the gesture)`. Captured on the
+    /// press frame and consumed at release to record ONE `FieldPatch::Deform` per gesture.
+    deform_gesture_before: Option<(String, Option<crate::models::layer_model::manifest::DeformRec>)>,
 }
 
 /// Worker result for a non-destructive raster effects render (mirrors the typing tab's
@@ -365,6 +395,17 @@ impl Default for PsEditorTabState {
             page_sizes_px: HashMap::new(),
             raster_effects_state: None,
             pending_raster_effects: None,
+            // Start with the count cap and a default (Medium-profile) byte budget. The PS editor has
+            // no live `MemoryProfile` handle wired in Part A, so this fixed Medium cap stands in for a
+            // profile-driven budget; wiring `set_memory_profile` through the tab is a follow-up.
+            history: ActionHistory::with_weight_budget(
+                PS_EDITOR_UNDO_LIMIT,
+                MemoryBudget::for_profile(MemoryProfile::default()).ps_editor_undo_bytes_usize(),
+            ),
+            brush_stroke_dirty: None,
+            opacity_gesture: None,
+            transform_gesture_before: None,
+            deform_gesture_before: None,
         }
     }
 }
@@ -731,6 +772,365 @@ impl PsEditorTabState {
         true
     }
 
+    /// Undoes the most recent PS-editor edit on the current page, if any. Returns whether anything
+    /// changed. Routes the reverted pixels to the shared doc + enqueues a disk save so cross-tab
+    /// state and persistence stay in sync. Safe on the GUI thread: the raster apply is a bounded,
+    /// per-tile delta reversal (no full-image work beyond the changed tiles).
+    pub fn undo(&mut self, project: &ProjectData) -> bool {
+        // Take-and-restore idiom (see `take_history`): the op `Ctx` is `Self` but `history` is a field
+        // of `Self`, so `self.history.undo(self)` would double-borrow. Restore the history
+        // UNCONDITIONALLY (no `?` between take and restore) so the stack is never lost on an error path.
+        let mut history = self.take_history();
+        let result = history.undo(self);
+        self.history = history;
+        self.finish_history_step(result, project, "undo")
+    }
+
+    /// Redoes the most recently undone PS-editor edit on the current page, if any. See [`Self::undo`].
+    pub fn redo(&mut self, project: &ProjectData) -> bool {
+        let mut history = self.take_history();
+        let result = history.redo(self);
+        self.history = history;
+        self.finish_history_step(result, project, "redo")
+    }
+
+    /// Shared tail of `undo`/`redo`: on a real change, persist the active page so the reverted state
+    /// survives a reload / save-to-project; logs and swallows an apply error (nothing changed).
+    ///
+    /// Uses `persist_current_page` (not a bare doc enqueue) because it reads the reconciled
+    /// `self.stack` and carries the EXPLICIT `removed_uids` from `deleted_raster_uids` — required so a
+    /// `LayerLifecycle` delete/undo drops or keeps the on-disk raster PNG correctly (the doc's own
+    /// `enqueue_page_save` passes an empty removed set, which would resurrect a just-deleted raster).
+    /// The PNG encode still runs off the GUI thread (the saver owns it).
+    fn finish_history_step(
+        &mut self,
+        result: Result<bool, edit_op::PsEditOpError>,
+        project: &ProjectData,
+        op: &str,
+    ) -> bool {
+        match result {
+            Ok(true) => {
+                self.persist_current_page(project);
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                crate::runtime_log::log_warn(format!("[ps_editor] {op}: {err}"));
+                false
+            }
+        }
+    }
+
+    /// Move the undo history out of `self`, leaving an empty history that preserves the count limit
+    /// and byte budget. Used only by the take-and-restore undo/redo idiom; the caller MUST put a
+    /// history back before returning.
+    fn take_history(&mut self) -> ActionHistory<PsEditOp> {
+        let limit = self.history.limit();
+        let replacement = match self.history.weight_budget() {
+            Some(budget) => ActionHistory::with_weight_budget(limit, budget),
+            None => ActionHistory::new(limit),
+        };
+        std::mem::replace(&mut self.history, replacement)
+    }
+
+    /// Applies a reversible raster delta to the resident layer identified by `layer_uid` on
+    /// `page_idx`, in `dir`. Mutates the layer's `image` + `base_image` (via
+    /// `edit_op::apply_raster_diff_to_layer`), marks the affected `render_cache` tiles dirty, and
+    /// pushes the resulting pixels to the shared doc (in-memory) so a later reprojection and cross-tab
+    /// consumers see the same result. This is the only mutation path used by PS-editor undo/redo.
+    ///
+    /// # Errors
+    /// - [`edit_op::PsEditOpError::NotResident`] if the stack is absent, on a different page, or the
+    ///   uid is no longer a resident raster.
+    /// - [`edit_op::PsEditOpError::Raster`] if the delta cannot be applied (size mismatch / corrupt).
+    fn apply_ps_raster_edit(
+        &mut self,
+        page_idx: usize,
+        layer_uid: &str,
+        diff: &RasterDiff,
+        dir: ApplyDirection,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        // Resolve the target raster (resident + matching page) and mutate its pixels.
+        let (id, uid, reverted, dirty) = {
+            let stack = self
+                .stack
+                .as_mut()
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            if stack.page_idx() != page_idx {
+                return Err(edit_op::PsEditOpError::NotResident { page_idx });
+            }
+            let id = stack
+                .layers()
+                .iter()
+                .find(|l| l.kind == LayerKind::Raster && l.uid.to_string() == layer_uid)
+                .map(|l| l.id)
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            let layer = stack
+                .layer_mut(id)
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            let dirty = edit_op::apply_raster_diff_to_layer(layer, diff, dir)?;
+            layer.pixels_dirty = true;
+            (id, layer.uid.to_string(), layer.image.clone(), dirty)
+        };
+
+        // Invalidate only the touched tiles so the next upload re-sends the reverted pixels.
+        if let Some(cache) = self.render_cache.get_mut(&id) {
+            for rect in &dirty {
+                cache.mark_dirty_rect(tools::DirtyRect {
+                    min_x: rect.origin_px[0] as usize,
+                    min_y: rect.origin_px[1] as usize,
+                    max_x: rect.origin_px[0]
+                        .saturating_add(rect.size_px[0].saturating_sub(1))
+                        as usize,
+                    max_y: rect.origin_px[1]
+                        .saturating_add(rect.size_px[1].saturating_sub(1))
+                        as usize,
+                });
+            }
+        }
+
+        // Route the reverted pixels to the shared doc (in-memory) so cross-tab consumers and the next
+        // `sync_view_from_doc` reprojection agree. A paintable raster has no effects, so
+        // base == display == reverted pixels. Disk persistence is enqueued by the undo/redo caller.
+        if let Some(doc) = self.layer_doc.clone()
+            && let Ok(mut guard) = doc.lock()
+            && guard.page(page_idx).is_some()
+        {
+            guard.set_raster_pixels(page_idx, &uid, reverted.clone(), reverted, Vec::new(), true);
+            guard.mark_changed();
+        }
+        Ok(())
+    }
+
+    /// Realizes a whole-raster-layer add/delete for undo/redo (see [`PsEditOp::LayerLifecycle`]).
+    /// `dir == Added` re-inserts `layer` (with its retained pixels) into the shared doc at Z `z` and
+    /// re-projects, so the stack + `render_cache` are rebuilt by `sync_view_from_doc`; `dir == Removed`
+    /// removes the node by uid and re-projects (which drops its cache). Deletion bookkeeping
+    /// (`deleted_raster_uids`) is updated so the next `persist_current_page` drops/keeps the on-disk
+    /// PNG correctly. Never panics.
+    ///
+    /// # Errors
+    /// [`edit_op::PsEditOpError::NotResident`] if no doc is wired, the target page is not resident, or
+    /// the add/remove could not be applied.
+    fn apply_ps_layer_lifecycle(
+        &mut self,
+        page_idx: usize,
+        layer: &Layer,
+        z: u32,
+        dir: LifecycleDir,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        // The op only makes sense while its page's stack is resident (the history is per-page).
+        if self.stack.as_ref().map(LayerStack::page_idx) != Some(page_idx) {
+            return Err(edit_op::PsEditOpError::NotResident { page_idx });
+        }
+        let Some(doc) = self.layer_doc.clone() else {
+            return Err(edit_op::PsEditOpError::NotResident { page_idx });
+        };
+        let uid = layer.uid.to_string();
+        let ok = {
+            let Ok(mut guard) = doc.lock() else {
+                return Err(edit_op::PsEditOpError::NotResident { page_idx });
+            };
+            if guard.page(page_idx).is_none() {
+                return Err(edit_op::PsEditOpError::NotResident { page_idx });
+            }
+            match dir {
+                LifecycleDir::Added => {
+                    // Rebuild the doc node from the retained layer. `pixels_dirty = true` so the next
+                    // persist rewrites its base PNG (the delete pruned it); preserve the deform mesh.
+                    let mut node = layer_to_raster_node(layer);
+                    node.pixels_dirty = true;
+                    if let crate::models::layer_model::layer_doc::NodeBody::Raster {
+                        base_image,
+                        display_image,
+                        ..
+                    } = &mut node.body
+                    {
+                        *base_image = layer.base_image.clone();
+                        *display_image = layer.image.clone();
+                    }
+                    node.deform = layer.deform.clone();
+                    let added = guard.add_node_at_z(page_idx, node, z);
+                    if added {
+                        guard.mark_changed();
+                    }
+                    added
+                }
+                LifecycleDir::Removed => {
+                    let removed = guard.remove_node(page_idx, &uid);
+                    if removed {
+                        guard.mark_changed();
+                    }
+                    removed
+                }
+            }
+        };
+        if !ok {
+            return Err(edit_op::PsEditOpError::NotResident { page_idx });
+        }
+        // Keep the deletion bookkeeping consistent so `persist_current_page` drops (Removed) or keeps
+        // (Added) the on-disk raster: `save_page_rasters` preserves manifest rasters not in the stack,
+        // so a removal must be explicit.
+        match dir {
+            LifecycleDir::Added => {
+                if let Some(set) = self.deleted_raster_uids.get_mut(&page_idx) {
+                    set.remove(&uid);
+                }
+            }
+            LifecycleDir::Removed => {
+                self.deleted_raster_uids
+                    .entry(page_idx)
+                    .or_default()
+                    .insert(uid);
+            }
+        }
+        // Rebuild the stack raster layers + text + bands (and prune/create the render cache) from the
+        // mutated doc — the same projection the forward add/delete paths use.
+        self.sync_view_from_doc(page_idx);
+        Ok(())
+    }
+
+    /// Applies a single metadata/geometry field change (visibility / opacity / transform / deform) to
+    /// the raster identified by `layer_uid` on `page_idx`, driving it to the patch's `after` value (see
+    /// [`PsEditOp::FieldPatch`]). Routes through the shared doc setter (so cross-tab consumers agree)
+    /// and re-projects; falls back to a direct stack mutation when no doc page is resident. These
+    /// fields do not change pixels, so no `render_cache` invalidation is needed (compositing re-reads
+    /// them each frame). Never panics.
+    ///
+    /// # Errors
+    /// [`edit_op::PsEditOpError::NotResident`] if the stack is absent, on a different page, or the uid
+    /// is no longer a resident raster.
+    fn apply_ps_field_patch(
+        &mut self,
+        page_idx: usize,
+        layer_uid: &str,
+        field: &LayerFieldPatch,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        // Resolve the target raster (resident + matching page).
+        let id = {
+            let stack = self
+                .stack
+                .as_ref()
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            if stack.page_idx() != page_idx {
+                return Err(edit_op::PsEditOpError::NotResident { page_idx });
+            }
+            stack
+                .layers()
+                .iter()
+                .find(|l| l.kind == LayerKind::Raster && l.uid.to_string() == layer_uid)
+                .map(|l| l.id)
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?
+        };
+        // Drive the doc to the `after` value (mirrors the forward edit's setter), then re-project.
+        let applied = self.edit_doc_node(page_idx, |doc| match field {
+            LayerFieldPatch::Visibility { after, .. } => {
+                doc.set_visibility(page_idx, layer_uid, *after);
+            }
+            LayerFieldPatch::Opacity { after, .. } => doc.set_opacity(page_idx, layer_uid, *after),
+            LayerFieldPatch::Transform { after, .. } => {
+                doc.set_transform(page_idx, layer_uid, transform_to_rec(*after));
+            }
+            LayerFieldPatch::Deform { after, .. } => {
+                doc.set_deform(page_idx, layer_uid, after.clone());
+            }
+        });
+        if !applied {
+            // No doc page resident: mutate the stack layer directly (matches the forward edits' local
+            // fallback). `edit_doc_node` returning false means the doc was never touched.
+            let layer = self
+                .stack
+                .as_mut()
+                .and_then(|s| s.layer_mut(id))
+                .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+            edit_op::apply_field_patch_to_layer(layer, field);
+        }
+        Ok(())
+    }
+
+    /// Records the just-committed brush stroke as a reversible undo entry (observer style — the
+    /// forward edit was already applied live). Builds a region-bounded `RasterDiff` from the
+    /// pre-stroke `base_image` ("before") and the painted `image` ("after") over the stroke's dirty
+    /// union, so no full-image scan is needed. A no-op stroke (empty diff) is not recorded.
+    fn record_brush_stroke(&mut self, page_idx: usize) {
+        let Some(union) = self.brush_stroke_dirty else {
+            return;
+        };
+        // Capture the region-local before/after buffers + uid while borrowing the stack immutably.
+        let captured = {
+            let Some(stack) = self.stack.as_ref() else {
+                return;
+            };
+            if stack.page_idx() != page_idx {
+                return;
+            }
+            let Some(layer) = stack.layer(stack.active_id()) else {
+                return;
+            };
+            // Only an editable raster (no effects) has base_image == pre-stroke pixels.
+            if layer.kind != LayerKind::Raster || !layer.effects.is_empty() {
+                return;
+            }
+            let size = layer.image.size;
+            let max_x = size[0].saturating_sub(1);
+            let max_y = size[1].saturating_sub(1);
+            let x0 = union.min_x.min(max_x);
+            let y0 = union.min_y.min(max_y);
+            let x1 = union.max_x.min(max_x);
+            let y1 = union.max_y.min(max_y);
+            if x1 < x0 || y1 < y0 {
+                return;
+            }
+            let w = x1 - x0 + 1;
+            let h = y1 - y0 + 1;
+            let before = edit_op::copy_region_premul(&layer.base_image, x0, y0, w, h);
+            let after = edit_op::copy_region_premul(&layer.image, x0, y0, w, h);
+            (layer.uid.to_string(), size, [x0, y0], [w, h], before, after)
+        };
+        let (uid, size, origin, region, before, after) = captured;
+        let (Some(origin), Some(region), Some(image_size)) = (
+            usize_pair_to_u32(origin),
+            usize_pair_to_u32(region),
+            usize_pair_to_u32(size),
+        ) else {
+            return;
+        };
+        match RasterDiff::from_region_pixels(
+            &before,
+            &after,
+            origin,
+            region,
+            image_size,
+            PS_UNDO_TILE_SIDE,
+        ) {
+            Ok(diff) if diff.is_empty() => {}
+            Ok(diff) => self.history.record(PsEditOp::RasterPixels {
+                page_idx,
+                layer_uid: uid,
+                diff: Arc::new(diff),
+                dir: ApplyDirection::Forward,
+                label: "Кисть".to_string(),
+            }),
+            Err(err) => {
+                crate::runtime_log::log_warn(format!(
+                    "[ps_editor] failed to build brush undo diff (page {page_idx}): {err}"
+                ));
+            }
+        }
+    }
+
+    /// The unified Z of the raster band with `uid` from the current `bands` projection, or 0 when
+    /// absent (a just-added raster whose band has not been projected yet, restored on top on redo).
+    fn raster_band_z(&self, uid: &str) -> u32 {
+        self.bands
+            .iter()
+            .find_map(|band| match band {
+                Band::Raster { uid: u, z } if u == uid => Some(*z),
+                Band::Raster { .. } | Band::TextGroup { .. } | Band::PinnedText { .. } => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// Resolves a raster `LayerId` to its stable doc uid (the cross-tab identity).
     fn raster_uid(&self, id: LayerId) -> Option<String> {
         self.stack
@@ -927,6 +1327,16 @@ impl PsEditorTabState {
         // Persist the page we are leaving (committed edits are already flushed; this catches any
         // model state not yet written). The new page reloads fresh from disk + the shared doc.
         self.persist_current_page(project);
+        // Undo history is per-page-session: a recorded diff is only valid while its page's layer image
+        // buffers are resident, and the new page rebuilds the stack from scratch. Drop it (and any
+        // in-progress brush-stroke union) so an undo cannot apply to the wrong page's pixels.
+        self.history.clear();
+        self.brush_stroke_dirty = None;
+        // Drop any in-progress gesture snapshots too, so a gesture straddling a page switch cannot
+        // record an undo step against the wrong page.
+        self.opacity_gesture = None;
+        self.transform_gesture_before = None;
+        self.deform_gesture_before = None;
         if self.loader.is_none() {
             return;
         }
@@ -1874,6 +2284,18 @@ impl PsEditorTabState {
                 self.route_to_doc(page_idx, project, |doc| {
                     doc.add_node(page_idx, node);
                 });
+                // Record the ADD (observer style — the layer is already live). Undo → inverse
+                // (Removed) deletes it; redo re-adds at the captured Z. Read the Z back from the
+                // re-projected bands (the doc assigned it on top).
+                if let Some(layer) = self.stack.as_ref().and_then(|s| s.layer(id)).cloned() {
+                    let z = self.raster_band_z(&layer.uid.to_string());
+                    self.history.record(PsEditOp::LayerLifecycle {
+                        page_idx,
+                        layer: Box::new(layer),
+                        z,
+                        dir: LifecycleDir::Added,
+                    });
+                }
             }
         }
         if actions.new_empty_group
@@ -1917,6 +2339,15 @@ impl PsEditorTabState {
             {
                 layer.visible = new_visible;
             }
+            // Record the toggle (a toggle always changes value → always record).
+            self.history.record(PsEditOp::FieldPatch {
+                page_idx,
+                layer_uid: uid,
+                field: LayerFieldPatch::Visibility {
+                    before: !new_visible,
+                    after: new_visible,
+                },
+            });
         }
         if let Some(i) = actions.toggle_visible_text
             && let Some(layer) = self.text_layers.get_mut(i)
@@ -1932,6 +2363,13 @@ impl PsEditorTabState {
         if let Some((id, value)) = actions.opacity_raster {
             // Live slider: fires only on actual value change (drag steps), not every idle frame.
             crate::trace_log!(cat::PS_EDITOR, "panel opacity_raster id={} value={:.3}", id, value);
+            // Snapshot the pre-drag opacity ONCE per gesture (the stack still holds it before this
+            // frame's apply), so the whole drag records a single undo step (see `opacity_gesture`).
+            if self.opacity_gesture.is_none()
+                && let Some(before) = self.stack.as_ref().and_then(|s| s.layer(id)).map(|l| l.opacity)
+            {
+                self.opacity_gesture = Some((id, before));
+            }
             // Live slider: mutate the doc node in memory + re-project, but don't flush each frame
             // (persisted on page-leave). Falls back to a local edit if no doc page is resident.
             if let (Some(page_idx), Some(uid)) = (page_idx, self.raster_uid(id)) {
@@ -1944,9 +2382,34 @@ impl PsEditorTabState {
             } else if let Some(layer) = self.stack.as_mut().and_then(|s| s.layer_mut(id)) {
                 layer.opacity = value;
             }
+        } else if let Some((id, before)) = self.opacity_gesture.take() {
+            // First frame with no further opacity change ⇒ the drag ended. Record one `FieldPatch`
+            // for the whole gesture if the value actually moved.
+            if let (Some(page_idx), Some(uid), Some(after)) = (
+                page_idx,
+                self.raster_uid(id),
+                self.stack.as_ref().and_then(|s| s.layer(id)).map(|l| l.opacity),
+            ) && (after - before).abs() > f32::EPSILON
+            {
+                self.history.record(PsEditOp::FieldPatch {
+                    page_idx,
+                    layer_uid: uid,
+                    field: LayerFieldPatch::Opacity { before, after },
+                });
+            }
         }
         if let Some(id) = actions.remove_raster {
             crate::trace_log!(cat::PS_EDITOR, "panel remove_raster id={} page={:?}", id, page_idx);
+            // Capture the FULL layer (with pixels) + its Z BEFORE removal so an undo can re-add it.
+            let captured = self
+                .stack
+                .as_ref()
+                .and_then(|s| s.layer(id))
+                .filter(|l| l.kind == LayerKind::Raster)
+                .cloned();
+            let captured_z = captured
+                .as_ref()
+                .map(|l| self.raster_band_z(&l.uid.to_string()));
             // Record the deletion (so the manifest save drops it — `flush_page`/`save_page_rasters`
             // preserve unowned rasters, so a removal must be explicit), remove it from the doc in
             // memory + re-project, then persist via `persist_current_page` (which carries the removed
@@ -1960,6 +2423,15 @@ impl PsEditorTabState {
                 stack.remove_layer(id);
             }
             self.persist_current_page(project);
+            // Record the DELETE (observer style). Undo → inverse (Added) re-adds it at its prior Z.
+            if let (Some(page_idx), Some(layer), Some(z)) = (page_idx, captured, captured_z) {
+                self.history.record(PsEditOp::LayerLifecycle {
+                    page_idx,
+                    layer: Box::new(layer),
+                    z,
+                    dir: LifecycleDir::Removed,
+                });
+            }
         }
         if let Some(id) = actions.merge_req {
             crate::trace_log!(cat::PS_EDITOR, "panel merge_down id={}", id);
@@ -2180,6 +2652,11 @@ impl PsEditorTabState {
 
     /// Moves a single raster or pinned-text band one step in Z. A grouped band reorders only within
     /// its group's run; an ungrouped band hops over the whole neighbouring block (group or band).
+    ///
+    // Z-reorder undo is a LATER part, not B1: this path writes the band order to disk synchronously
+    // (`save_page_band_order`, which must run LAST so it wins over the raster save) in addition to the
+    // doc — a dual-persistence ordering the unified undo/redo persist tail cannot reproduce without a
+    // dedicated per-op persistence hook. So no `PsEditOp` is recorded here yet.
     fn move_band_one(&mut self, sel: RowSel, up: bool, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
@@ -2279,6 +2756,9 @@ impl PsEditorTabState {
 
     /// Resolves a `GroupOp` into a `persist::GroupingEdit`, mirrors the raster-side changes into the
     /// in-memory stack, persists, and reloads the overlays/bands view.
+    ///
+    // Group ops are OUT of scope for undo Part B1 (they share the same disk-band-order dual write as
+    // `move_band_one`); no `PsEditOp` is recorded here. Deferred to a later part.
     fn apply_group_op(&mut self, op: GroupOp, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
@@ -3040,6 +3520,25 @@ impl PsEditorTabState {
 
         // Route input to the active tool unless the user is panning or dragging a text layer.
         if !pan_active && !text_drag_active {
+            // Snapshot the active raster's transform/deform at gesture START (before the tool mutates
+            // the stack this frame), so the release commit records ONE undo step per gesture — not one
+            // per drag frame. Cleared/consumed in the matching release blocks below.
+            if input.primary_pressed && self.active_tool_id() == PsToolId::Transform {
+                self.transform_gesture_before = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.layer(s.active_id()))
+                    .filter(|l| l.kind == LayerKind::Raster)
+                    .map(|l| (l.uid.to_string(), l.transform));
+            }
+            if input.primary_pressed && self.active_tool_id() == PsToolId::Deform {
+                self.deform_gesture_before = self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.layer(s.active_id()))
+                    .filter(|l| l.kind == LayerKind::Raster)
+                    .map(|l| (l.uid.to_string(), l.deform.clone()));
+            }
             let outcome = if let Some(stack) = self.stack.as_mut() {
                 let pointer_image = input.hover_pos.map(|p| view.screen_to_world(p));
                 let mut tool_ctx = PsToolContext {
@@ -3076,22 +3575,57 @@ impl PsEditorTabState {
             }
             self.apply_tool_outcome(outcome);
 
+            // Accumulate the active brush stroke's per-segment dirty rects into a union so the release
+            // commit can build a region-bounded undo diff. Reset on the press frame (which also paints
+            // the first stamp, so reset must run before accumulating this frame's dirty rect).
+            if self.active_tool_id() == PsToolId::Brush {
+                if input.primary_pressed {
+                    self.brush_stroke_dirty = None;
+                }
+                if let Some(d) = outcome.dirty {
+                    self.brush_stroke_dirty = Some(match self.brush_stroke_dirty {
+                        Some(u) => tools::DirtyRect {
+                            min_x: u.min_x.min(d.min_x),
+                            min_y: u.min_y.min(d.min_y),
+                            max_x: u.max_x.max(d.max_x),
+                            max_y: u.max_y.max(d.max_y),
+                        },
+                        None => d,
+                    });
+                }
+            }
+
             // Transform tool release on a raster: commit the live (stack-mutated) transform to the
             // shared doc so the move/rotate/scale is the model truth (and cross-tab visible).
             if input.primary_released
                 && self.active_tool_id() == PsToolId::Transform
                 && let Some(page_idx) = self.active_page_idx
-                && let Some((uid, transform)) = self
+                && let Some((uid, after_lt)) = self
                     .stack
                     .as_ref()
                     .and_then(|s| s.layer(s.active_id()))
                     .filter(|l| l.kind == LayerKind::Raster)
-                    .map(|l| (l.uid.to_string(), transform_to_rec(l.transform)))
+                    .map(|l| (l.uid.to_string(), l.transform))
             {
                 crate::trace_log!(cat::SYNC, "commit transform page={} uid={}", page_idx, uid);
                 self.route_to_doc(page_idx, project, |doc| {
-                    doc.set_transform(page_idx, &uid, transform);
+                    doc.set_transform(page_idx, &uid, transform_to_rec(after_lt));
                 });
+                // Record ONE `FieldPatch::Transform` for the completed gesture, if it actually moved
+                // the same layer we snapshotted at press.
+                if let Some((before_uid, before_lt)) = self.transform_gesture_before.take()
+                    && before_uid == uid
+                    && before_lt != after_lt
+                {
+                    self.history.record(PsEditOp::FieldPatch {
+                        page_idx,
+                        layer_uid: uid,
+                        field: LayerFieldPatch::Transform {
+                            before: before_lt,
+                            after: after_lt,
+                        },
+                    });
+                }
             }
 
             // Deform tool release on a raster: commit the live mesh grid (stack-mutated) to the
@@ -3109,29 +3643,60 @@ impl PsEditorTabState {
             {
                 crate::trace_log!(cat::SYNC, "commit deform page={} uid={}", page_idx, uid);
                 self.route_to_doc(page_idx, project, |doc| {
-                    doc.set_deform(page_idx, &uid, deform);
+                    doc.set_deform(page_idx, &uid, deform.clone());
                 });
+                // Record ONE `FieldPatch::Deform` for the completed gesture, if the mesh actually
+                // changed on the same layer we snapshotted at press (entering deform mode seeds an
+                // identity grid: None → Some(identity) is a real, undoable state change).
+                if let Some((before_uid, before_deform)) = self.deform_gesture_before.take()
+                    && before_uid == uid
+                    && !deform_eq(&before_deform, &deform)
+                {
+                    self.history.record(PsEditOp::FieldPatch {
+                        page_idx,
+                        layer_uid: uid,
+                        field: LayerFieldPatch::Deform {
+                            before: before_deform,
+                            after: deform,
+                        },
+                    });
+                }
             }
 
-            // Brush stroke commit: on pointer-up, push the active raster's painted base pixels to the
-            // doc. During the stroke the local image is mutated live (responsive); the commit makes
-            // the doc the model truth (and cross-tab visible). A paintable raster has no effects, so
-            // base == display == painted pixels.
+            // Brush stroke commit: on pointer-up, record the reversible undo diff, then push the
+            // active raster's painted base pixels to the doc. During the stroke the local `image` is
+            // mutated live (responsive) while `base_image` still holds the pre-stroke pixels, so
+            // `record_brush_stroke` reads the "before" from `base_image` for free — no stroke-start
+            // snapshot. The commit makes the doc the model truth (and cross-tab visible). A paintable
+            // raster has no effects, so base == display == painted pixels.
             if input.primary_released
                 && self.active_tool_id() == PsToolId::Brush
                 && let Some(page_idx) = self.active_page_idx
-                && let Some((uid, painted)) = self
+            {
+                // Record BEFORE routing to the doc (the doc push + next reprojection sync base_image to
+                // the painted pixels, which would erase the "before").
+                self.record_brush_stroke(page_idx);
+                if let Some((uid, painted)) = self
                     .stack
                     .as_ref()
                     .and_then(|s| s.layer(s.active_id()))
-                    .filter(|l| l.kind == LayerKind::Raster && l.pixels_dirty && l.effects.is_empty())
+                    .filter(|l| {
+                        l.kind == LayerKind::Raster && l.pixels_dirty && l.effects.is_empty()
+                    })
                     .map(|l| (l.uid.to_string(), l.image.clone()))
-            {
-                let base = painted.clone();
-                crate::trace_log!(cat::SYNC, "commit brush_pixels page={} uid={}", page_idx, uid);
-                self.route_to_doc(page_idx, project, |doc| {
-                    doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
-                });
+                {
+                    let base = painted.clone();
+                    crate::trace_log!(
+                        cat::SYNC,
+                        "commit brush_pixels page={} uid={}",
+                        page_idx,
+                        uid
+                    );
+                    self.route_to_doc(page_idx, project, |doc| {
+                        doc.set_raster_pixels(page_idx, &uid, base, painted, Vec::new(), true);
+                    });
+                }
+                self.brush_stroke_dirty = None;
             }
         }
 
@@ -3769,17 +4334,23 @@ impl PsEditorTabState {
     ///
     /// Letter shortcuts are suppressed while a widget holds keyboard focus so they do not fire
     /// while the user is interacting with a focused control.
-    pub fn handle_hotkeys(&mut self, ctx: &egui::Context) {
+    pub fn handle_hotkeys(&mut self, ctx: &egui::Context, project: &ProjectData) {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
-        let (b, m, l, v, deselect) = ctx.input(|i| {
+        let (b, m, l, v, deselect, undo, redo) = ctx.input(|i| {
+            let cmd = i.modifiers.command;
             (
                 i.key_pressed(egui::Key::B),
                 i.key_pressed(egui::Key::M),
                 i.key_pressed(egui::Key::L),
                 i.key_pressed(egui::Key::V),
-                i.modifiers.command && i.key_pressed(egui::Key::D),
+                cmd && i.key_pressed(egui::Key::D),
+                // Ctrl/Cmd+Z (without Shift) = undo.
+                cmd && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                // Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y = redo.
+                cmd && ((i.modifiers.shift && i.key_pressed(egui::Key::Z))
+                    || i.key_pressed(egui::Key::Y)),
             )
         });
         if b && let Some(idx) = self.tool_index(PsToolId::Brush) {
@@ -3796,6 +4367,12 @@ impl PsEditorTabState {
         }
         if deselect {
             self.clear_selection();
+        }
+        // Undo takes priority; the two are mutually exclusive for a given key event anyway.
+        if undo {
+            self.undo(project);
+        } else if redo {
+            self.redo(project);
         }
     }
 }
@@ -4105,6 +4682,29 @@ fn transform_to_rec(t: LayerTransform) -> TransformRec {
         cy: t.center.y,
         rotation: t.rotation,
         scale: t.scale,
+    }
+}
+
+/// Converts a `[usize; 2]` pixel pair into `[u32; 2]`, or `None` if either component exceeds `u32`
+/// (unreachable for realistic image dimensions). Keeps the raster-diff conversions free of lossy
+/// `as` casts.
+fn usize_pair_to_u32(pair: [usize; 2]) -> Option<[u32; 2]> {
+    Some([u32::try_from(pair[0]).ok()?, u32::try_from(pair[1]).ok()?])
+}
+
+/// Structural equality of two optional deform meshes (`DeformRec` has no `PartialEq`): both `None`,
+/// or both `Some` with equal grid dimensions and identical control points. Used to detect whether a
+/// deform gesture actually changed the mesh before recording an undo step.
+fn deform_eq(
+    a: &Option<crate::models::layer_model::manifest::DeformRec>,
+    b: &Option<crate::models::layer_model::manifest::DeformRec>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => {
+            a.cols == b.cols && a.rows == b.rows && a.points_px == b.points_px
+        }
+        (None, Some(_)) | (Some(_), None) => false,
     }
 }
 

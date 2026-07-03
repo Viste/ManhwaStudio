@@ -113,9 +113,18 @@ X range before the old overflow point.
   `scene.page_world_rects`); the canvas owns geometry, the tab owns mark content.
 - Bubble persistence is routed through `BubblesModel` saver tasks; canvas runtime should keep
   unsaved runtime edits explicit until they are flushed to the model.
-- Bubble undo entries (`BubbleHistoryEntry`) hold an `Arc<Vec<Bubble>>` snapshot plus the model
-  revision they were taken at. Capturing is an O(1) Arc bump, and entries are deduplicated by
-  revision (monotonic, bumped per mutation), not by content hash. `flush_bubble_upserts_to_model`
+- Bubble undo/redo is delegated to the generic `ms-actions` engine
+  (`bubble_runtime.rs::bubble_history: ActionHistory<BubbleSnapshotOp>`; the op lives in
+  `bubble_action.rs`). It is a behavior-preserving FULL snapshot op, not a field-level patch:
+  each op holds `Arc<Vec<Bubble>>` before/after snapshots and reverses by `BubblesModel::reset`.
+  Mutation is observer-style — the call site mutates the model directly, then history is recorded.
+  `capture_bubble_history_before_mutation` stages the pre-mutation snapshot + revision in
+  `pending_history_before`; the next capture (or an undo/redo) finalizes it into a recorded op via
+  `finalize_pending_history`, using the then-current state as the mutation's `after`. Recording is
+  deduplicated by revision (monotonic, bumped per mutation): a staged snapshot whose revision still
+  matches the current model produced no mutation and records nothing, so one gesture is one op. The
+  engine enforces the `BUBBLE_HISTORY_LIMIT` cap and truncates the redo branch on a fresh record.
+  `flush_bubble_upserts_to_model`
   debounces positional model writes while a continuous drag/resize gesture is active
   (`aside_drag_state` / `on_top_drag_state` / `active_rect_handle` / `active_area_handle`): the
   runtime bubble still follows the pointer each frame, but the model is written only on release,

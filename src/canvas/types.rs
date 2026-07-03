@@ -24,7 +24,7 @@ Notes:
 */
 
 use crate::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
-use crate::project::{Bubble, Side};
+use crate::project::Side;
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
 use serde_json::{Map, Value};
@@ -506,21 +506,6 @@ pub(crate) struct FocusedBubbleTextInput {
 pub(crate) struct CanvasContextMenuTarget {
     pub(crate) page_idx: usize,
     pub(crate) page_uv: Pos2,
-}
-
-/// One undo/redo entry: a shared snapshot of the whole bubble list plus the model
-/// revision it was taken at.
-///
-/// `bubbles` is an `Arc` so capturing a snapshot is an O(1) refcount bump (the model already
-/// owns the list behind an `Arc`), not a deep clone of every bubble. `revision` is the
-/// `BubblesModel` revision at capture time; it is the cheap identity used to dedup consecutive
-/// snapshots of an unchanged model (the revision is monotonic and bumped on every mutation), so
-/// a gesture that changed nothing does not push a no-op entry. It replaces the old per-frame
-/// `serde_json` content hash.
-#[derive(Clone)]
-pub(crate) struct BubbleHistoryEntry {
-    pub(crate) bubbles: Arc<Vec<Bubble>>,
-    pub(crate) revision: u64,
 }
 
 #[derive(Clone, Copy)]

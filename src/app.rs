@@ -2428,9 +2428,9 @@ impl eframe::App for MangaApp {
                 });
             }
             AppTab::PsEditor => {
-                self.ps_editor_tab.handle_hotkeys(ctx);
                 let project = &self.project;
                 let ps_editor = &mut self.ps_editor_tab;
+                ps_editor.handle_hotkeys(ctx, project);
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ps_editor.draw(ctx, ui, project);
                 });

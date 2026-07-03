@@ -32,11 +32,11 @@ use super::helpers::{
     normalize_image_text_areas, parse_image_text_areas, sanitize_clipboard_text,
     serialize_image_text_areas, side_to_string, upsert_rect_coords_into_extra,
 };
+use super::bubble_action::BubbleSnapshotOp;
 use super::types::{
-    AsideDragState, AsideItem, BubbleAction, BubbleCopyPasteTarget, BubbleHistoryEntry,
-    BubbleTextField, CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput,
-    ImageTextArea, OnTopDragState, PageBubbleBuckets, PendingBubblePaste, RectCoords,
-    RuntimeBubble,
+    AsideDragState, AsideItem, BubbleAction, BubbleCopyPasteTarget, BubbleTextField,
+    CanvasContextMenuTarget, CopiedBubbleData, FocusedBubbleTextInput, ImageTextArea,
+    OnTopDragState, PageBubbleBuckets, PendingBubblePaste, RectCoords, RuntimeBubble,
 };
 use super::{
     BUBBLE_HISTORY_LIMIT, BubbleClass, BubbleType, CanvasHooks, CanvasView,
@@ -48,6 +48,7 @@ use crate::project::{Bubble, ProjectData, Side};
 use crate::runtime_log;
 use eframe::egui;
 use egui::{Pos2, Rect};
+use ms_actions::ActionHistory;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -141,8 +142,13 @@ pub(super) struct BubbleRuntimeState {
     pub(super) canvas_context_menu_target: Option<CanvasContextMenuTarget>,
     pub(super) bubble_context_menu_misspelled_word: Option<String>,
     pub(super) pending_bubble_paste: Option<PendingBubblePaste>,
-    pub(super) bubble_undo_stack: Vec<BubbleHistoryEntry>,
-    pub(super) bubble_redo_stack: Vec<BubbleHistoryEntry>,
+    /// Bubble undo/redo history, delegated to the generic `ms-actions` engine.
+    /// Holds full-snapshot ops (`BubbleSnapshotOp`); see `bubble_action.rs`.
+    pub(super) bubble_history: ActionHistory<BubbleSnapshotOp>,
+    /// Pre-mutation bubble snapshot + model revision staged by
+    /// `capture_bubble_history_before_mutation`, awaiting the post-mutation state
+    /// to be turned into a recorded op. See the history flow in the impl below.
+    pub(super) pending_history_before: Option<(Arc<Vec<Bubble>>, u64)>,
     pub(super) synced_bubbles_revision: u64,
     pub(super) bubbles_model: Option<Arc<Mutex<BubblesModel>>>,
 }
@@ -172,8 +178,8 @@ impl Default for BubbleRuntimeState {
             canvas_context_menu_target: None,
             bubble_context_menu_misspelled_word: None,
             pending_bubble_paste: None,
-            bubble_undo_stack: Vec::new(),
-            bubble_redo_stack: Vec::new(),
+            bubble_history: ActionHistory::new(BUBBLE_HISTORY_LIMIT),
+            pending_history_before: None,
             synced_bubbles_revision: 0,
             bubbles_model: None,
         }
@@ -193,13 +199,36 @@ impl BubbleRuntimeState {
             || self.active_rect_handle.is_some()
             || self.active_area_handle.is_some()
     }
+
+    /// Records the staged pre-mutation snapshot as a `BubbleSnapshotOp` if the model actually
+    /// changed since it was staged, using `current`/`current_revision` as the mutation's `after`.
+    ///
+    /// Consumes `pending_history_before`. When the staged revision equals `current_revision` the
+    /// model was not mutated (a no-op capture or a repeated capture of one unchanged state), so
+    /// nothing is recorded — this is the revision-based dedup that keeps one gesture to one undo
+    /// entry. Recording pushes onto `bubble_history` (clearing the redo branch and enforcing the
+    /// history limit, both handled by the engine).
+    fn finalize_pending_history(&mut self, current: &Arc<Vec<Bubble>>, current_revision: u64) {
+        let Some((before, before_revision)) = self.pending_history_before.take() else {
+            return;
+        };
+        if before_revision == current_revision {
+            return;
+        }
+        let label = format!("bubbles {} -> {}", before.len(), current.len());
+        self.bubble_history.record(BubbleSnapshotOp::new(
+            label,
+            before,
+            Arc::clone(current),
+        ));
+    }
 }
 
 impl CanvasView {
     pub fn set_bubbles_model(&mut self, model: Arc<Mutex<BubblesModel>>) {
         self.bubble_runtime.bubbles_model = Some(model);
-        self.bubble_runtime.bubble_undo_stack.clear();
-        self.bubble_runtime.bubble_redo_stack.clear();
+        self.bubble_runtime.bubble_history.clear();
+        self.bubble_runtime.pending_history_before = None;
     }
 
     pub fn delete_selected_bubble_shortcut(&mut self) -> bool {
@@ -699,14 +728,16 @@ impl CanvasView {
         }
     }
 
-    /// Captures the pre-mutation bubble state for undo, exactly once per logical change.
+    /// Stages the pre-mutation bubble state for undo, exactly once per logical change.
     ///
-    /// The snapshot is taken as a shared `Arc` (O(1)) together with the model revision and is
-    /// deduplicated by revision: the model revision is monotonic and bumped on every mutation, so
-    /// repeated captures while the model is unchanged (e.g. the per-frame flush calls during one
-    /// continuous drag, which is debounced and writes the model only on release) collapse to a
-    /// single undo entry. This replaces the former per-call full snapshot + `serde_json` content
-    /// hash.
+    /// Snapshots the model as a shared `Arc` (O(1)) with its revision and stages it as the
+    /// `before` of the upcoming mutation. Before staging, it finalizes any previously staged
+    /// mutation using the now-current state as that mutation's `after`, recording a
+    /// `BubbleSnapshotOp` into the history. Recording is deduplicated by revision: the model
+    /// revision is monotonic and bumped on every mutation, so repeated captures while the model
+    /// is unchanged (e.g. the per-frame flush calls during one continuous drag, which is
+    /// debounced and writes the model only on release) do not produce an op. The undo migration
+    /// keeps this behavior on the generic `ms-actions` engine.
     pub(super) fn capture_bubble_history_before_mutation(&mut self) {
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             return;
@@ -720,140 +751,78 @@ impl CanvasView {
             };
             (locked.snapshot_shared(), locked.revision())
         };
-        self.push_bubble_undo_snapshot(bubbles, revision);
-    }
-
-    fn push_bubble_undo_snapshot(&mut self, bubbles: Arc<Vec<Bubble>>, revision: u64) {
-        // Dedup by revision: a capture for a model state already on top of the stack is a no-op,
-        // so a gesture that changed nothing (or repeated captures within one unchanged model
-        // state) does not push a duplicate undo entry.
-        if self
-            .bubble_runtime
-            .bubble_undo_stack
-            .last()
-            .is_some_and(|entry| entry.revision == revision)
-        {
-            return;
-        }
+        // The current state is the `after` of any prior staged-but-unrecorded mutation.
         self.bubble_runtime
-            .bubble_undo_stack
-            .push(BubbleHistoryEntry { bubbles, revision });
-        if self.bubble_runtime.bubble_undo_stack.len() > BUBBLE_HISTORY_LIMIT {
-            let overflow = self.bubble_runtime.bubble_undo_stack.len() - BUBBLE_HISTORY_LIMIT;
-            self.bubble_runtime.bubble_undo_stack.drain(0..overflow);
-        }
-        self.bubble_runtime.bubble_redo_stack.clear();
-    }
-
-    fn push_bubble_redo_snapshot(&mut self, bubbles: Arc<Vec<Bubble>>, revision: u64) {
-        if self
-            .bubble_runtime
-            .bubble_redo_stack
-            .last()
-            .is_some_and(|entry| entry.revision == revision)
-        {
-            return;
-        }
-        self.bubble_runtime
-            .bubble_redo_stack
-            .push(BubbleHistoryEntry { bubbles, revision });
-        if self.bubble_runtime.bubble_redo_stack.len() > BUBBLE_HISTORY_LIMIT {
-            let overflow = self.bubble_runtime.bubble_redo_stack.len() - BUBBLE_HISTORY_LIMIT;
-            self.bubble_runtime.bubble_redo_stack.drain(0..overflow);
-        }
+            .finalize_pending_history(&bubbles, revision);
+        // Stage this state as the `before` of the mutation the caller is about to perform.
+        self.bubble_runtime.pending_history_before = Some((bubbles, revision));
     }
 
     pub(super) fn try_undo_bubbles_history(&mut self) -> bool {
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             return false;
         };
-        let Some(target) = self.bubble_runtime.bubble_undo_stack.pop() else {
-            return false;
-        };
         let Ok(mut locked) = model.lock() else {
-            self.bubble_runtime.bubble_undo_stack.push(target);
             runtime_log::log_warn(
                 "[canvas::bubble_runtime] failed to lock BubblesModel for undo operation",
             );
             return false;
         };
+        // Finalize the just-completed edit (staged, not yet recorded) so it is undoable.
         let current = locked.snapshot_shared();
         let current_revision = locked.revision();
-        let mut redo_pushed = false;
-        if self
-            .bubble_runtime
-            .bubble_redo_stack
-            .last()
-            .is_none_or(|entry| entry.revision != current_revision)
-        {
-            self.push_bubble_redo_snapshot(current, current_revision);
-            redo_pushed = true;
-        }
-        if let Err(err) = locked.reset(target.bubbles.as_ref().clone()) {
-            if redo_pushed {
-                self.bubble_runtime.bubble_redo_stack.pop();
+        self.bubble_runtime
+            .finalize_pending_history(&current, current_revision);
+        match self.bubble_runtime.bubble_history.undo(&mut *locked) {
+            Ok(true) => {
+                let restored = locked.snapshot_shared();
+                let revision = locked.revision();
+                drop(locked);
+                self.apply_bubbles_history_snapshot(restored.as_ref(), revision);
+                true
             }
-            self.bubble_runtime.bubble_undo_stack.push(target);
-            runtime_log::log_error(format!(
-                "[canvas::bubble_runtime] failed to apply undo snapshot; error={err:#}"
-            ));
-            return false;
+            Ok(false) => false,
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[canvas::bubble_runtime] failed to apply undo snapshot; error={err}"
+                ));
+                false
+            }
         }
-        let revision = locked.revision();
-        drop(locked);
-        self.apply_bubbles_history_snapshot(&target.bubbles, revision);
-        true
     }
 
     pub(super) fn try_redo_bubbles_history(&mut self) -> bool {
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             return false;
         };
-        let Some(target) = self.bubble_runtime.bubble_redo_stack.pop() else {
-            return false;
-        };
         let Ok(mut locked) = model.lock() else {
-            self.bubble_runtime.bubble_redo_stack.push(target);
             runtime_log::log_warn(
                 "[canvas::bubble_runtime] failed to lock BubblesModel for redo operation",
             );
             return false;
         };
+        // Finalizing here records any fresh edit, which truncates the redo branch (a new edit
+        // abandons the redoable future) exactly as before the migration.
         let current = locked.snapshot_shared();
         let current_revision = locked.revision();
-        let mut undo_pushed = false;
-        if self
-            .bubble_runtime
-            .bubble_undo_stack
-            .last()
-            .is_none_or(|entry| entry.revision != current_revision)
-        {
-            self.bubble_runtime
-                .bubble_undo_stack
-                .push(BubbleHistoryEntry {
-                    bubbles: current,
-                    revision: current_revision,
-                });
-            if self.bubble_runtime.bubble_undo_stack.len() > BUBBLE_HISTORY_LIMIT {
-                let overflow = self.bubble_runtime.bubble_undo_stack.len() - BUBBLE_HISTORY_LIMIT;
-                self.bubble_runtime.bubble_undo_stack.drain(0..overflow);
+        self.bubble_runtime
+            .finalize_pending_history(&current, current_revision);
+        match self.bubble_runtime.bubble_history.redo(&mut *locked) {
+            Ok(true) => {
+                let restored = locked.snapshot_shared();
+                let revision = locked.revision();
+                drop(locked);
+                self.apply_bubbles_history_snapshot(restored.as_ref(), revision);
+                true
             }
-            undo_pushed = true;
-        }
-        if let Err(err) = locked.reset(target.bubbles.as_ref().clone()) {
-            if undo_pushed {
-                self.bubble_runtime.bubble_undo_stack.pop();
+            Ok(false) => false,
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[canvas::bubble_runtime] failed to apply redo snapshot; error={err}"
+                ));
+                false
             }
-            self.bubble_runtime.bubble_redo_stack.push(target);
-            runtime_log::log_error(format!(
-                "[canvas::bubble_runtime] failed to apply redo snapshot; error={err:#}"
-            ));
-            return false;
         }
-        let revision = locked.revision();
-        drop(locked);
-        self.apply_bubbles_history_snapshot(&target.bubbles, revision);
-        true
     }
 
     fn apply_bubbles_history_snapshot(&mut self, bubbles: &[Bubble], revision: u64) {
@@ -2311,7 +2280,9 @@ mod tests {
             revision_before,
             "model must not be written while the drag is active"
         );
-        assert!(canvas.bubble_runtime.bubble_undo_stack.is_empty());
+        // No mutation happened, so nothing is staged or recorded for undo yet.
+        assert!(!canvas.bubble_runtime.bubble_history.can_undo());
+        assert!(canvas.bubble_runtime.pending_history_before.is_none());
         // The dragged bubble's final runtime position followed the pointer live.
         let final_u = canvas.bubble_runtime.runtime_bubbles[&1].img_u;
         assert!(
@@ -2325,14 +2296,6 @@ mod tests {
         canvas.bubble_runtime.pending_upsert.insert(1);
         canvas.flush_bubble_upserts_to_model(&project);
 
-        // Exactly one undo entry, capturing the pre-gesture anchor.
-        assert_eq!(canvas.bubble_runtime.bubble_undo_stack.len(), 1);
-        let undo_anchor = canvas.bubble_runtime.bubble_undo_stack[0].bubbles[0].img_u;
-        assert!(
-            (undo_anchor - 0.30).abs() < 1e-4,
-            "undo must hold pre-gesture anchor: {undo_anchor}"
-        );
-
         // The model now holds the committed final position.
         let committed_u = model
             .lock()
@@ -2342,6 +2305,32 @@ mod tests {
         assert!(
             (committed_u - 0.55).abs() < 1e-4,
             "final position must commit: {committed_u}"
+        );
+
+        // Exactly one undoable entry: undo restores the pre-gesture anchor, and a second undo
+        // finds nothing (the whole drag collapsed into a single history op).
+        assert!(canvas.try_undo_bubbles_history());
+        let undone_u = model
+            .lock()
+            .expect("lock model")
+            .with_bubble(1, |b| b.img_u)
+            .expect("bubble 1 exists");
+        assert!(
+            (undone_u - 0.30).abs() < 1e-4,
+            "undo must restore the pre-gesture anchor: {undone_u}"
+        );
+        assert!(!canvas.try_undo_bubbles_history());
+
+        // Redo returns to the committed final position.
+        assert!(canvas.try_redo_bubbles_history());
+        let redone_u = model
+            .lock()
+            .expect("lock model")
+            .with_bubble(1, |b| b.img_u)
+            .expect("bubble 1 exists");
+        assert!(
+            (redone_u - 0.55).abs() < 1e-4,
+            "redo must restore the committed anchor: {redone_u}"
         );
     }
 
@@ -2531,25 +2520,24 @@ mod tests {
 
     #[test]
     fn capture_history_dedups_by_revision_not_content() {
-        // Two captures with no intervening model mutation share a revision and must collapse to a
-        // single undo entry; a real mutation between them yields a second entry.
+        // Repeated captures with no intervening model mutation share a revision and must not
+        // create an undoable entry; each real mutation yields exactly one. Dedup is by revision,
+        // not content, so this is proven by how many undos succeed.
         let project = empty_project();
         let model = test_model(vec![text_bubble_record(1, 0, 0.40, 0.40, Side::Left)]);
         let mut canvas = CanvasView::default();
         canvas.set_bubbles_model(Arc::clone(&model));
         canvas.sync_runtime_from_model_or_project(&project);
 
+        // Two captures, no mutation: nothing becomes undoable.
         canvas.capture_bubble_history_before_mutation();
         canvas.capture_bubble_history_before_mutation();
-        assert_eq!(
-            canvas.bubble_runtime.bubble_undo_stack.len(),
-            1,
-            "repeat capture of an unchanged model is a no-op"
+        assert!(
+            !canvas.bubble_runtime.bubble_history.can_undo(),
+            "repeat capture of an unchanged model records nothing"
         );
 
-        // First real mutation: the pre-write capture dedups against the existing entry (same
-        // revision), then the write advances the model revision. Stack stays at one entry holding
-        // the pre-mutation state.
+        // First real mutation.
         canvas
             .bubble_runtime
             .runtime_bubbles
@@ -2558,14 +2546,8 @@ mod tests {
             .img_u = 0.60;
         canvas.bubble_runtime.pending_upsert.insert(1);
         canvas.flush_bubble_upserts_to_model(&project);
-        assert_eq!(
-            canvas.bubble_runtime.bubble_undo_stack.len(),
-            1,
-            "the first mutation's pre-state was already captured"
-        );
 
-        // Second real mutation: now the pre-write capture sees the advanced revision and pushes a
-        // distinct entry, proving dedup is by revision, not content.
+        // Second real mutation.
         canvas
             .bubble_runtime
             .runtime_bubbles
@@ -2574,7 +2556,22 @@ mod tests {
             .img_u = 0.20;
         canvas.bubble_runtime.pending_upsert.insert(1);
         canvas.flush_bubble_upserts_to_model(&project);
-        assert_eq!(canvas.bubble_runtime.bubble_undo_stack.len(), 2);
+
+        let anchor = |model: &Arc<Mutex<BubblesModel>>| {
+            model
+                .lock()
+                .expect("lock model")
+                .with_bubble(1, |b| b.img_u)
+                .expect("bubble 1 exists")
+        };
+
+        // Exactly two mutations are undoable, restored in reverse order; the earlier no-op
+        // captures added nothing.
+        assert!(canvas.try_undo_bubbles_history());
+        assert!((anchor(&model) - 0.60).abs() < 1e-4);
+        assert!(canvas.try_undo_bubbles_history());
+        assert!((anchor(&model) - 0.40).abs() < 1e-4);
+        assert!(!canvas.try_undo_bubbles_history());
     }
 
     #[test]
