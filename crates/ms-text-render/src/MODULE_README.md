@@ -58,6 +58,13 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `pipeline.rs`: central orchestration, horizontal rendering, line metrics, inline glyph
   overrides, shape comparison, cancellation handling, and post-effect application.
 - `font_registry.rs`: selected font loading and inline-font registry construction.
+  Loading is now cache-gated through `FontFaceCache` (see `font_system_pool.rs`)
+  so a reused `FontSystem` does not accumulate duplicate faces.
+- `font_system_pool.rs`: process-global checkout pool of reusable
+  `cosmic_text::FontSystem` instances (+ their `FontFaceCache`). Owns
+  `with_leased_font_system` (used by `pipeline::render_text_to_image`) and
+  `prewarm_font_system_pool` (re-exported for the app to call from a background
+  thread).
 - `inline_styles.rs`: parser/remapper for inline tags, attrs-compatible style spans, and
   line-level inline alignment markers.
 - `raster.rs`: low-level swash sampling, alpha/source-over blending, glyph drawing,
@@ -79,7 +86,14 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   outline extraction/flattening + cache, the single zeno coverage-mask rasterizer
   (monochrome tint contract + `blend_pixel_over`), the anti-aliasing coverage->alpha
   transfer table (`build_aa_lut`, applied inside `rasterize_outline_into` before the
-  tint multiply), and `Outline`->`GlyphContour`
+  tint multiply), and `Outline`->`GlyphContour`. Allocation reuse: `OutlineCache`
+  owns the reusable swash `ScaleContext` (extraction on a miss takes `&mut context`
+  instead of building a fresh one), and `RasterScratch` holds the rasterizer's
+  per-glyph buffers (subpath polylines, zeno commands, coverage mask). Each draw
+  path creates ONE `RasterScratch` next to its `OutlineCache::new()` and threads
+  `&mut scratch` into every `rasterize_outline_into` call. `RasterScratch` resets
+  per glyph WITHOUT freeing capacity and re-zeroes the coverage mask, so buffer
+  reuse is byte-identical to a fresh allocation.
   conversion. Wired into the on-path / formula / custom-line composite pass
   (`formula/render.rs`), the horizontal path (`pipeline.rs`, including the
   inline-rotated variant), and the vertical path (`layout/vertical.rs`) via the
@@ -105,6 +119,40 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   See `effects/MODULE_README.md`.
 
 ## Contracts and invariants
+- FontSystem pool (`font_system_pool.rs`): `render_text_to_image` wraps its whole
+  body in `with_leased_font_system`, which leases a reusable `FontSystem` + its
+  `FontFaceCache` from a process-global pool instead of building a fresh
+  `FontSystem` per render (the fresh build ran a full system-font scan every
+  call). The pool must preserve BYTE-IDENTICAL output across reuse: font loads go
+  through `FontFaceCache` (keyed by path/len/mtime), so a reused system reuses the
+  already-loaded faces instead of re-registering duplicates, and default families
+  are set every render for deterministic matching. Two determinism guards keep a
+  reused system byte-identical to a fresh one:
+  - Pristine default restoration: `FontFaceCache::for_system` captures the fresh
+    system's five generic default-family names (sans-serif/serif/monospace/
+    cursive/fantasy) once at creation. `font_registry::apply_default_families`
+    installs the selected face's family as all five defaults when it HAS a family
+    name, and RESTORES the captured pristine names when it does NOT — so a
+    no-family face never inherits a prior render's family from the reused db.
+  - Taint-and-drop: font matching is by family name. If two DIFFERENT files
+    (different `FileKey`) declare the same `(family, weight, style, stretch)`,
+    `Family::Name` resolution becomes history-dependent. The loader marks the
+    cache `tainted` on such a collision (logged once via `runtime_log::log_warn`)
+    and `return_to_pool`/`should_requeue` DROP a tainted system so it can never
+    serve a future render. Documented residual: the single render that first
+    triggers the collision may still mis-match before the system is dropped (rare,
+    self-healing). Stale colliding faces are NOT removed even though fontdb
+    exposes `remove_face`, because both colliding files may be used together as
+    inline fonts in one render, so removing one file's faces could break that
+    file's own text; taint-drop is the safe bound.
+  Growth is bounded — a leased system is dropped instead of requeued once its
+  cache exceeds `MAX_CACHED_FILES` or the pool holds `MAX_POOLED_SYSTEMS`. The
+  renderer must not panic while a system is leased (a panic leaks that one system;
+  the pool recreates it). `prewarm_font_system_pool` (re-exported) lets the app
+  pay the first scan on a background thread. The pool is NOT used by the throwaway
+  metric-measurement `FontSystem` in the typing panel, which passes its own
+  one-shot `FontFaceCache::new()` (no pristine defaults captured — single-use, so
+  no restore is needed).
 - `TextRenderParams` is the only caller-facing input contract. When adding a field or
   enum variant, update `types.rs`, parser/serialization call sites in the parent
   `typing` module, the smoke anchor in `mod.rs`, and focused tests.
@@ -190,11 +238,15 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - To change caller-visible render parameters or result shape, start in `types.rs`, then
   update `mod.rs` smoke anchors and parent typing serialization/parsing.
 - To change normal horizontal rendering, glyph scaling, kerning, hanging punctuation,
-  line spacing, shape comparison, or routing, edit `pipeline.rs`. Horizontal
-  monochrome glyphs rasterize from outlines via `draw_horizontal_glyph` (normal)
-  and the `RotatedGlyphPlacement` draw pass (inline-rotated), both using
-  `glyph_blit::glyph_outline_transform`; the outline->world pivot lives in
-  `glyph_blit.rs`, not here.
+  line spacing, shape comparison, or routing, edit `pipeline.rs`. The normal
+  horizontal path is SINGLE-PASS: `horizontal_run_layout` + `get_image` run once per
+  glyph, collecting each into a `HorizontalGlyphPlacement`
+  (`build_horizontal_placement`) reused for both the bounds box (via
+  `include_scaled_rect_bounds` on the swash bitmap placement box) and the draw pass
+  (`draw_horizontal_placement`); the inline-rotated path collects
+  `RotatedGlyphPlacement` the same way. Horizontal monochrome glyphs rasterize from
+  outlines via `glyph_blit::glyph_outline_transform`; the outline->world pivot lives
+  in `glyph_blit.rs`, not here.
 - Kerning-mode contract (`KerningMode`, `types.rs`): `Auto` (user label "Авто")
   applies font GPOS/`kern` pair kerning — the shaped cosmic-text positions plus
   manual tracking; it is the byte-identical successor of the historical `Metric`

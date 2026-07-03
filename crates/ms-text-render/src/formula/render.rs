@@ -51,7 +51,8 @@ use crate::glyph_contour::{
     GlyphContour, PlacedContour, min_placed_distance,
 };
 use crate::vector::{
-    Outline, OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
+    Outline, OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline,
+    rasterize_outline_into,
 };
 use crate::inline_styles::{
     InlineGlyphOffset, InlineStyleSpan, apply_inline_style_to_attrs,
@@ -461,6 +462,8 @@ fn render_text_with_drawn_lines_layout_once(
     // (via the transforms below) and the composite pass so each glyph is
     // extracted at most once per render.
     let mut outline_cache = OutlineCache::new();
+    // Reused per-glyph rasterizer buffers for the composite pass (see `RasterScratch`).
+    let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
     let mut transforms = build_drawn_line_transforms(
@@ -630,6 +633,7 @@ fn render_text_with_drawn_lines_layout_once(
                 glyph_subpixel_offset(physical.cache_key),
             );
             rasterize_outline_into(
+                &mut raster_scratch,
                 rgba.as_mut_slice(),
                 out_width as usize,
                 out_height as usize,
@@ -1533,6 +1537,8 @@ fn render_text_with_formula_layout_once(
     // Per-render outline cache for the vector composite pass (color glyphs fall
     // back to the bitmap blit, so they are never extracted here).
     let mut outline_cache = OutlineCache::new();
+    // Reused per-glyph rasterizer buffers for the composite pass (see `RasterScratch`).
+    let mut raster_scratch = RasterScratch::new();
     // Coverage->alpha transfer table for the selected AA mode, built once per render.
     let aa_lut = build_aa_lut(params.anti_aliasing);
     let has_inline_size_overrides =
@@ -1782,6 +1788,7 @@ fn render_text_with_formula_layout_once(
                 glyph_subpixel_offset(physical.cache_key),
             );
             rasterize_outline_into(
+                &mut raster_scratch,
                 rgba.as_mut_slice(),
                 out_width as usize,
                 out_height as usize,

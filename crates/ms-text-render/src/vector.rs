@@ -18,12 +18,17 @@ Key structures:
 - FillRule: glyph fill winding rule (TrueType/CFF use non-zero).
 - Outline: flattened, y-down glyph-local closed subpaths + cached local bbox.
 - GlyphTransform: local->world affine, same convention as `PlacedContour`.
-- OutlineKey / OutlineCache: resolution-independent outline cache.
+- OutlineKey / OutlineCache: resolution-independent outline cache; `OutlineCache`
+  also owns the reusable swash `ScaleContext` used on a cache miss.
+- RasterScratch: reusable per-render rasterizer buffers (subpaths, zeno commands,
+  coverage mask) so `rasterize_outline_into` allocates nothing per glyph.
 
 Key functions:
-- extract_glyph_outline: swash outline -> flattened `Outline`.
+- extract_glyph_outline: swash outline -> flattened `Outline` (via a reused
+  `ScaleContext` passed by the caller).
 - flatten_quad / flatten_cubic: adaptive bezier flattening.
-- rasterize_outline_into: the single vector rasterizer (zeno + tint + over-blend).
+- rasterize_outline_into: the single vector rasterizer (zeno + tint + over-blend);
+  takes a `&mut RasterScratch` and resets it per glyph for byte-identical reuse.
 - glyph_contour_from_outline: `Outline` -> `GlyphContour` for measurement.
 
 Coordinate note (y-flip):
@@ -225,25 +230,48 @@ impl OutlineKey {
 /// Extracted-outline cache.
 ///
 /// Stores `Option<Arc<Outline>>` so a glyph known to have no fillable outline
-/// (space/empty) is cached as a negative result and not re-extracted.
-#[derive(Debug, Default)]
+/// (space/empty) is cached as a negative result and not re-extracted. Owns the
+/// reusable `swash::scale::ScaleContext` so a cache MISS extracts through one
+/// shared scaler context instead of building a fresh `ScaleContext` (with its
+/// internal caches) per glyph. `ScaleContext` is not `Debug`, so `Debug` is
+/// implemented manually and only reports the entry count.
 pub(crate) struct OutlineCache {
     map: HashMap<OutlineKey, Option<Arc<Outline>>>,
+    /// Reused swash scaler context; passed by `&mut` into `extract_glyph_outline`
+    /// on every cache miss so extraction does not allocate a new context.
+    context: swash::scale::ScaleContext,
+}
+
+impl std::fmt::Debug for OutlineCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ScaleContext is not Debug; report only the observable cache size.
+        f.debug_struct("OutlineCache")
+            .field("entries", &self.map.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for OutlineCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OutlineCache {
-    /// Empty cache.
+    /// Empty cache with a fresh reusable scaler context.
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
             map: HashMap::new(),
+            context: swash::scale::ScaleContext::new(),
         }
     }
 
     /// Return the cached outline for `key`, extracting it once on a miss.
     ///
     /// `font`/`glyph_id`/`em_px` must correspond to `key`. Returns `None` (and
-    /// caches it) when the glyph has no fillable outline. Never panics.
+    /// caches it) when the glyph has no fillable outline. The miss path extracts
+    /// through the cache-owned reusable `ScaleContext`. Never panics.
     pub(crate) fn get_or_extract(
         &mut self,
         key: OutlineKey,
@@ -254,7 +282,7 @@ impl OutlineCache {
         if let Some(cached) = self.map.get(&key) {
             return cached.clone();
         }
-        let extracted = extract_glyph_outline(font, glyph_id, em_px).map(Arc::new);
+        let extracted = extract_glyph_outline(&mut self.context, font, glyph_id, em_px).map(Arc::new);
         self.map.insert(key, extracted.clone());
         extracted
     }
@@ -266,18 +294,78 @@ impl OutlineCache {
     }
 }
 
+/// Reusable per-render scratch buffers for [`rasterize_outline_into`].
+///
+/// The rasterizer needs three working buffers per glyph: the canvas-space
+/// subpath polylines, the zeno path commands, and the 8-bit coverage mask.
+/// Allocating them fresh per glyph is real allocator traffic across hundreds of
+/// glyphs per render (thousands across a preview grid). Threading one
+/// `RasterScratch` through every rasterize call on a render path reuses those
+/// allocations.
+///
+/// Reset contract (BYTE-IDENTICAL to a fresh allocation): each glyph clears
+/// every buffer WITHOUT freeing capacity and re-zeroes the coverage mask to the
+/// new window size. Inner subpath Vecs are pooled (`subpath_pool`) so a glyph
+/// with N subpaths does not re-allocate N inner Vecs. No stale point, command,
+/// or coverage byte may survive between glyphs — `rasterize_outline_into`
+/// depends on a fully zeroed coverage mask because `Mask::render_into` only
+/// writes covered cells.
+#[derive(Debug, Default)]
+pub(crate) struct RasterScratch {
+    /// Canvas-space subpath polylines for the current glyph. The outer Vec is
+    /// reused; inner Vecs come from and return to `subpath_pool`.
+    canvas_subpaths: Vec<Vec<[f32; 2]>>,
+    /// Free list of inner subpath Vecs (each already cleared) reclaimed from
+    /// `canvas_subpaths` so their capacity survives between glyphs.
+    subpath_pool: Vec<Vec<[f32; 2]>>,
+    /// zeno path commands for the current glyph.
+    commands: Vec<Command>,
+    /// 8-bit coverage mask sized to the current glyph's raster window.
+    coverage: Vec<u8>,
+}
+
+impl RasterScratch {
+    /// Empty scratch; buffers grow to fit on first use.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reclaim the previous glyph's inner subpath Vecs into the pool (clearing
+    /// each) and clear the command buffer, retaining all capacity. Call once at
+    /// the start of each glyph before rebuilding. Coverage is (re)sized and
+    /// zeroed separately once the raster window is known.
+    fn begin_glyph(&mut self) {
+        for mut subpath in self.canvas_subpaths.drain(..) {
+            subpath.clear();
+            self.subpath_pool.push(subpath);
+        }
+        self.commands.clear();
+    }
+
+    /// Take an already-cleared inner subpath Vec from the pool, or a fresh empty
+    /// one if the pool is empty. Its capacity is preserved for reuse.
+    #[must_use]
+    fn take_subpath(&mut self) -> Vec<[f32; 2]> {
+        self.subpath_pool.pop().unwrap_or_default()
+    }
+}
+
 /// Extract and flatten a glyph outline at `em_px` pixels-per-em.
 ///
 /// Uses `swash::scale::Scaler::scale_outline`; swash reports points y-up, and
 /// this function negates y so the result is y-down glyph-local pixels
 /// consistent with `raster.rs`/`glyph_contour.rs`. Quadratics and cubics are
-/// flattened to `DEFAULT_FLATTEN_TOLERANCE_PX`.
+/// flattened to `DEFAULT_FLATTEN_TOLERANCE_PX`. `context` is a reusable swash
+/// scaler context (owned by `OutlineCache`) so callers do not build a fresh
+/// `ScaleContext` per extraction.
 ///
 /// Returns `None` for a glyph with no fillable outline (space/empty), a
 /// non-finite or non-positive `em_px`, or a color glyph (handled elsewhere).
 /// Never panics on a missing/invalid glyph id.
 #[must_use]
 pub(crate) fn extract_glyph_outline(
+    context: &mut swash::scale::ScaleContext,
     font: &swash::FontRef,
     glyph_id: u16,
     em_px: f32,
@@ -285,7 +373,6 @@ pub(crate) fn extract_glyph_outline(
     if !em_px.is_finite() || em_px <= 0.0 {
         return None;
     }
-    let mut context = swash::scale::ScaleContext::new();
     let mut scaler = context.builder(*font).size(em_px).hint(false).build();
     let outline = scaler.scale_outline(glyph_id)?;
     // Color glyphs have no monochrome fill contract; the bitmap path owns them.
@@ -575,10 +662,17 @@ pub(crate) fn build_aa_lut(mode: AntiAliasingMode) -> [u8; 256] {
 /// `canvas` must be at least `canvas_w * canvas_h * 4` bytes; a shorter buffer
 /// is a no-op. Never panics and never indexes out of range for transforms that
 /// push the glyph partly or fully off-canvas (such pixels are clipped).
-// The rasterizer call site naturally carries canvas target, origin, outline,
-// transform, tint and the AA transfer table; splitting them would obscure the mapping.
+///
+/// `scratch` supplies the reused per-glyph working buffers (subpaths, zeno
+/// commands, coverage mask). It is reset per call (see [`RasterScratch`]) so the
+/// result is byte-identical to a freshly allocated render regardless of what the
+/// previous glyph left in it.
+// The rasterizer call site naturally carries the scratch, canvas target, origin,
+// outline, transform, tint and the AA transfer table; splitting them would
+// obscure the mapping.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rasterize_outline_into(
+    scratch: &mut RasterScratch,
     canvas: &mut [u8],
     canvas_w: usize,
     canvas_h: usize,
@@ -604,13 +698,17 @@ pub(crate) fn rasterize_outline_into(
 
     let (cos, sin) = (transform.rot.cos(), transform.rot.sin());
 
+    // Reset the scratch for this glyph: reclaim the previous glyph's inner Vecs
+    // and clear the command buffer, all without freeing capacity.
+    scratch.begin_glyph();
+
     // Transform every subpath point to canvas space (world - origin) and track
-    // the path bounding box in canvas coordinates.
-    let mut canvas_subpaths: Vec<Vec<[f32; 2]>> = Vec::with_capacity(outline.subpaths.len());
+    // the path bounding box in canvas coordinates. Inner point Vecs are pulled
+    // from the scratch pool so no per-glyph allocation happens on reuse.
     let mut min = [f32::INFINITY, f32::INFINITY];
     let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
     for subpath in &outline.subpaths {
-        let mut world_pts: Vec<[f32; 2]> = Vec::with_capacity(subpath.len());
+        let mut world_pts = scratch.take_subpath();
         for &local in subpath {
             let world = transform.apply(local, cos, sin);
             let cx = world[0] - origin_x;
@@ -621,11 +719,14 @@ pub(crate) fn rasterize_outline_into(
             max[1] = max[1].max(cy);
             world_pts.push([cx, cy]);
         }
-        if !world_pts.is_empty() {
-            canvas_subpaths.push(world_pts);
+        if world_pts.is_empty() {
+            // Return the unused Vec to the pool so its capacity is not lost.
+            scratch.subpath_pool.push(world_pts);
+        } else {
+            scratch.canvas_subpaths.push(world_pts);
         }
     }
-    if canvas_subpaths.is_empty() || !min[0].is_finite() {
+    if scratch.canvas_subpaths.is_empty() || !min[0].is_finite() {
         return;
     }
 
@@ -648,28 +749,34 @@ pub(crate) fn rasterize_outline_into(
     // correct winding/coverage at the window edges while writing only inside it.
     let shift_x = win_min_x as f32;
     let shift_y = win_min_y as f32;
-    let mut commands: Vec<Command> = Vec::new();
-    for subpath in &canvas_subpaths {
+    // `commands` was already cleared by `begin_glyph`; rebuild disjoint from the
+    // subpath buffer (both are distinct fields of `scratch`).
+    for subpath in &scratch.canvas_subpaths {
         for (i, p) in subpath.iter().enumerate() {
             let pt = Vector::new(p[0] - shift_x, p[1] - shift_y);
             if i == 0 {
-                commands.push(Command::MoveTo(pt));
+                scratch.commands.push(Command::MoveTo(pt));
             } else {
-                commands.push(Command::LineTo(pt));
+                scratch.commands.push(Command::LineTo(pt));
             }
         }
-        commands.push(Command::Close);
+        scratch.commands.push(Command::Close);
     }
 
     let (Ok(mask_w_u32), Ok(mask_h_u32)) = (u32::try_from(mask_w), u32::try_from(mask_h)) else {
         return;
     };
-    let mut coverage = vec![0u8; mask_w.saturating_mul(mask_h)];
-    Mask::new(&commands[..])
+    // Resize and fully zero the coverage mask: `clear` + `resize(_, 0)` leaves
+    // every cell 0 (fresh-allocation semantics) while retaining capacity, which
+    // `render_into` requires because it only writes covered cells.
+    let coverage_len = mask_w.saturating_mul(mask_h);
+    scratch.coverage.clear();
+    scratch.coverage.resize(coverage_len, 0);
+    Mask::new(&scratch.commands[..])
         .style(outline.winding.to_zeno())
         .format(Format::Alpha)
         .size(mask_w_u32, mask_h_u32)
-        .render_into(&mut coverage, None);
+        .render_into(&mut scratch.coverage, None);
 
     // Monochrome tint contract (doc 4.1): RGB replaced by color, alpha scaled by
     // coverage and the color's alpha. Identical math to raster::sample_swash_pixel.
@@ -678,7 +785,7 @@ pub(crate) fn rasterize_outline_into(
         let canvas_y = win_min_y + my;
         for mx in 0..mask_w {
             // Map raw coverage through the AA transfer table before tinting.
-            let cov = aa_lut[usize::from(coverage[my * mask_w + mx])];
+            let cov = aa_lut[usize::from(scratch.coverage[my * mask_w + mx])];
             if cov == 0 {
                 continue;
             }
@@ -819,6 +926,13 @@ mod tests {
         build_aa_lut(AntiAliasingMode::Smooth)
     }
 
+    /// Extract an outline through a throwaway scaler context. Tests do not need
+    /// to reuse the context across calls, unlike `OutlineCache`.
+    fn extract_outline(font: &swash::FontRef, glyph_id: u16, em_px: f32) -> Option<Outline> {
+        let mut ctx = swash::scale::ScaleContext::new();
+        extract_glyph_outline(&mut ctx, font, glyph_id, em_px)
+    }
+
     /// Load the shared Latin+Cyrillic test face bytes.
     fn load_test_font_bytes() -> Vec<u8> {
         // Fixture lives at the workspace root; this crate sits two levels down
@@ -893,7 +1007,7 @@ mod tests {
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, 'H');
         let em = 64.0;
-        let outline = extract_glyph_outline(&font, gid, em).expect("H has an outline");
+        let outline = extract_outline(&font, gid, em).expect("H has an outline");
         assert!(!outline.subpaths().is_empty(), "H must have >= 1 subpath");
         let (min, max) = outline.local_bbox();
         let width = max[0] - min[0];
@@ -912,7 +1026,7 @@ mod tests {
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, ' ');
         assert!(
-            extract_glyph_outline(&font, gid, 64.0).is_none(),
+            extract_outline(&font, gid, 64.0).is_none(),
             "space glyph has no fillable outline"
         );
     }
@@ -922,9 +1036,9 @@ mod tests {
         let data = load_test_font_bytes();
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, 'H');
-        assert!(extract_glyph_outline(&font, gid, 0.0).is_none());
-        assert!(extract_glyph_outline(&font, gid, -5.0).is_none());
-        assert!(extract_glyph_outline(&font, gid, f32::NAN).is_none());
+        assert!(extract_outline(&font, gid, 0.0).is_none());
+        assert!(extract_outline(&font, gid, -5.0).is_none());
+        assert!(extract_outline(&font, gid, f32::NAN).is_none());
     }
 
     #[test]
@@ -1009,9 +1123,11 @@ mod tests {
         // reference placement. origin maps world -> canvas so ink lands on the
         // same pixels: origin_x = placement.left; origin_y = -placement.top
         // (our y-down outline vs the reference bottom-left origin, see header).
-        let outline = extract_glyph_outline(&font, gid, em).expect("R outline");
+        let outline = extract_outline(&font, gid, em).expect("R outline");
         let mut canvas = vec![0u8; ref_w * ref_h * 4];
+        let mut scratch = RasterScratch::new();
         rasterize_outline_into(
+            &mut scratch,
             &mut canvas,
             ref_w,
             ref_h,
@@ -1044,14 +1160,17 @@ mod tests {
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, 'H');
         let em = 64.0;
-        let outline = extract_glyph_outline(&font, gid, em).expect("H outline");
+        let outline = extract_outline(&font, gid, em).expect("H outline");
         let (min, max) = outline.local_bbox();
         let w = (max[0] - min[0]).ceil() as usize + 4;
         let h = (max[1] - min[1]).ceil() as usize + 4;
 
-        // Opaque red: covered pixels are exactly the tint RGB.
+        // Opaque red: covered pixels are exactly the tint RGB. One scratch is
+        // reused for both renders below to also exercise scratch reuse.
+        let mut scratch = RasterScratch::new();
         let mut canvas_full = vec![0u8; w * h * 4];
         rasterize_outline_into(
+            &mut scratch,
             &mut canvas_full,
             w,
             h,
@@ -1074,6 +1193,7 @@ mod tests {
         // Half alpha: coverage alpha is halved vs the opaque render (+/- 1).
         let mut canvas_half = vec![0u8; w * h * 4];
         rasterize_outline_into(
+            &mut scratch,
             &mut canvas_half,
             w,
             h,
@@ -1095,20 +1215,91 @@ mod tests {
     }
 
     #[test]
+    fn shared_scratch_matches_fresh_scratch() {
+        // Reusing one `RasterScratch` must leave no stale state: rendering glyph
+        // B through a scratch already dirtied by glyph A must be byte-identical to
+        // rendering B through a brand-new scratch.
+        let data = load_test_font_bytes();
+        let font = swash::FontRef::from_index(&data, 0).expect("valid font");
+        let em = 64.0;
+        let outline_a = extract_outline(&font, glyph_for_char(&font, 'A'), em).expect("A outline");
+        let outline_b = extract_outline(&font, glyph_for_char(&font, 'B'), em).expect("B outline");
+        let (min, max) = outline_b.local_bbox();
+        let w = (max[0] - min[0]).ceil() as usize + 6;
+        let h = (max[1] - min[1]).ceil() as usize + 6;
+        let origin_x = min[0] - 3.0;
+        let origin_y = min[1] - 3.0;
+        let lut = identity_lut();
+
+        // Reference: render B into a fresh scratch.
+        let mut fresh_scratch = RasterScratch::new();
+        let mut fresh_canvas = vec![0u8; w * h * 4];
+        rasterize_outline_into(
+            &mut fresh_scratch,
+            &mut fresh_canvas,
+            w,
+            h,
+            origin_x,
+            origin_y,
+            &outline_b,
+            &GlyphTransform::identity(),
+            [255, 255, 255, 255],
+            &lut,
+        );
+
+        // Shared scratch: dirty it with A (different bbox/window), then render B.
+        let mut shared_scratch = RasterScratch::new();
+        let mut dirty_canvas = vec![0u8; w * h * 4];
+        rasterize_outline_into(
+            &mut shared_scratch,
+            &mut dirty_canvas,
+            w,
+            h,
+            origin_x,
+            origin_y,
+            &outline_a,
+            &GlyphTransform::identity(),
+            [255, 255, 255, 255],
+            &lut,
+        );
+        let mut reused_canvas = vec![0u8; w * h * 4];
+        rasterize_outline_into(
+            &mut shared_scratch,
+            &mut reused_canvas,
+            w,
+            h,
+            origin_x,
+            origin_y,
+            &outline_b,
+            &GlyphTransform::identity(),
+            [255, 255, 255, 255],
+            &lut,
+        );
+
+        assert_eq!(
+            fresh_canvas, reused_canvas,
+            "scratch reuse must be byte-identical to a fresh-scratch render"
+        );
+    }
+
+    #[test]
     fn rotation_swaps_bbox_and_offcanvas_is_safe() {
         let data = load_test_font_bytes();
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, 'L');
         let em = 64.0;
-        let outline = extract_glyph_outline(&font, gid, em).expect("L outline");
+        let outline = extract_outline(&font, gid, em).expect("L outline");
         let (min, max) = outline.local_bbox();
         let ow = max[0] - min[0];
         let oh = max[1] - min[1];
 
-        // Identity render: measure the alpha bbox.
+        // Identity render: measure the alpha bbox. One scratch is reused across
+        // all three renders in this test to exercise reuse.
+        let mut scratch = RasterScratch::new();
         let big = 200usize;
         let mut c_id = vec![0u8; big * big * 4];
         rasterize_outline_into(
+            &mut scratch,
             &mut c_id,
             big,
             big,
@@ -1131,6 +1322,7 @@ mod tests {
         // that keeps the rotated ink on-canvas.
         let mut c_rot = vec![0u8; big * big * 4];
         rasterize_outline_into(
+            &mut scratch,
             &mut c_rot,
             big,
             big,
@@ -1162,6 +1354,7 @@ mod tests {
             scale: [1.0, 1.0],
         };
         rasterize_outline_into(
+            &mut scratch,
             &mut c_off,
             big,
             big,
@@ -1230,7 +1423,7 @@ mod tests {
         let font = swash::FontRef::from_index(&data, 0).expect("valid font");
         let gid = glyph_for_char(&font, 'H');
         let em = 64.0;
-        let outline = extract_glyph_outline(&font, gid, em).expect("H outline");
+        let outline = extract_outline(&font, gid, em).expect("H outline");
         let (min, max) = outline.local_bbox();
         // Pad so the shifted ink never clips the canvas edge on any axis.
         let w = (max[0] - min[0]).ceil() as usize + 8;
@@ -1240,7 +1433,9 @@ mod tests {
 
         let render_at = |pos: [f32; 2]| -> (f32, f32) {
             let mut canvas = vec![0u8; w * h * 4];
+            let mut scratch = RasterScratch::new();
             rasterize_outline_into(
+                &mut scratch,
                 &mut canvas,
                 w,
                 h,
@@ -1288,7 +1483,7 @@ mod tests {
         // per subpath; the glyph has an outer and an inner ring => 2 subpaths.
         // We assert the OUTER AABB matches the outline bbox and that at least the
         // outer contour is present.
-        let o_outline = extract_glyph_outline(&font, glyph_for_char(&font, 'O'), em)
+        let o_outline = extract_outline(&font, glyph_for_char(&font, 'O'), em)
             .expect("O outline");
         let o_contour = glyph_contour_from_outline(&o_outline, 0.5);
         assert!(
@@ -1304,7 +1499,7 @@ mod tests {
         assert!((placed.aabb_max[1] - omax[1]).abs() <= 2.0);
 
         // ':' (colon) is two disjoint ink blobs -> two components.
-        let colon_outline = extract_glyph_outline(&font, glyph_for_char(&font, ':'), em)
+        let colon_outline = extract_outline(&font, glyph_for_char(&font, ':'), em)
             .expect("colon outline");
         let colon_contour = glyph_contour_from_outline(&colon_outline, 0.5);
         assert_eq!(

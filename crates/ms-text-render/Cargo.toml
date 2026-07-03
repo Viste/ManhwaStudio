@@ -1,0 +1,18 @@
+[package]
+name = "ms-text-render"
+version = "0.1.0"
+edition = "2024"
+
+# The production text renderer for the typing tab, extracted from
+# src/tabs/typing/render_next. GUI-free: shaping/layout via cosmic-text, vector
+# glyph rasterization via zeno, RGBA output via the image crate.
+[dependencies]
+ms-log = { path = "../ms-log" }
+ms-text-util = { path = "../ms-text-util" }
+cosmic-text = "0.14"
+swash = "0.2"
+zeno = "0.3"
+hyphenation = { version = "0.8", features = ["embed_all"] }
+image = { version = "0.25", default-features = true }
+rayon = "1"
+serde_json = "1"

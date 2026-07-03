@@ -109,7 +109,7 @@ use crate::tabs::typing::tab::TypingExportFormat;
 use crate::tabs::typing::tab::TypingTextOverlayLayer;
 use crate::tabs::typing::render_next::forms::{self, PeakBase, TextForm, TextFormPreset};
 use crate::tabs::typing::segmentation::Conservatism;
-use crate::tabs::typing::render_next::load_selected_font_from_path;
+use crate::tabs::typing::render_next::{FontFaceCache, load_selected_font_from_path};
 use crate::tabs::typing::render_next::render_text_to_image;
 use crate::tabs::typing::render_next::types::{
     AntiAliasingMode, HorizontalAlign, InlineFontEntry, KerningMode, PxOrPercent, RenderedTextImage,

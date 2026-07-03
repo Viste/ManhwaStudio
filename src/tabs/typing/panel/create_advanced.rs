@@ -884,7 +884,13 @@ impl TypingCreatePanelState {
         // Лёгкая система шрифтов: пустая БД + только нужный файл (без системных шрифтов).
         let mut font_system =
             FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new());
-        let selected_face = load_selected_font_from_path(&mut font_system, &path, face_index).ok()?;
+        // One-shot throwaway system: use a fresh, empty cache. This path is not
+        // pooled (it deliberately avoids the system-font scan for metric-only
+        // measurement), so the cache only satisfies the load API.
+        let mut font_cache = FontFaceCache::new();
+        let selected_face =
+            load_selected_font_from_path(&mut font_system, &mut font_cache, &path, face_index)
+                .ok()?;
         let mut attrs = Attrs::new().metrics(Metrics::new(METRIC_EM, METRIC_EM));
         attrs = selected_face.apply_to_attrs(attrs);
         if self.force_bold {

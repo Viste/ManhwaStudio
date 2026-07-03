@@ -1,0 +1,8 @@
+[package]
+name = "ms-log"
+version = "0.1.0"
+edition = "2024"
+
+# Standalone logging + tracing layer for ManhwaStudio.
+# Pure std, no external dependencies, no dependency on the application crate.
+[dependencies]

@@ -24,6 +24,7 @@ use std::path::PathBuf;
 pub mod drawn_lines;
 mod effects;
 mod font_registry;
+mod font_system_pool;
 mod formula;
 mod glyph_blit;
 mod glyph_contour;
@@ -42,9 +43,18 @@ mod wrap;
 pub use wrap::forms;
 
 // Резолвер PostScript-имени шрифта переиспользуется PSD-экспортом вкладки typing.
+// `load_selected_font_from_path` теперь cache-gated и требует `FontFaceCache`
+// (владелец — pooled `FontSystem`); внешние вызовы с одноразовой `FontSystem`
+// создают одноразовый `FontFaceCache::new()`.
 pub use font_registry::{
     load_selected_font_from_path, resolve_font_family_name, resolve_font_postscript_name,
 };
+pub use font_system_pool::FontFaceCache;
+
+// Прогрев пула `FontSystem` из фонового потока: приложение вызывает
+// `ms_text_render::prewarm_font_system_pool()`, чтобы первый пользовательский
+// рендер не платил за системное сканирование шрифтов.
+pub use font_system_pool::prewarm_font_system_pool;
 
 type RenderNextCancel<'a> = Option<(&'a std::sync::Arc<std::sync::atomic::AtomicU64>, u64)>;
 
@@ -110,9 +120,11 @@ const _: fn(&glyph_contour::PlacedContour, &glyph_contour::PlacedContour) -> f32
 // path for all three modes (horizontal/vertical/on-path/formula); these entries
 // keep the full vector API surface compiled even where only a subset is reached
 // at runtime. See `vector.rs` and `VECTOR_ENGINE_REFACTOR.md`.
-const _: fn(&swash::FontRef, u16, f32) -> Option<vector::Outline> = vector::extract_glyph_outline;
+const _: fn(&mut swash::scale::ScaleContext, &swash::FontRef, u16, f32) -> Option<vector::Outline> =
+    vector::extract_glyph_outline;
 #[allow(clippy::type_complexity)]
 const _: fn(
+    &mut vector::RasterScratch,
     &mut [u8],
     usize,
     usize,
@@ -123,6 +135,7 @@ const _: fn(
     [u8; 4],
     &[u8; 256],
 ) = vector::rasterize_outline_into;
+const _: fn() -> vector::RasterScratch = vector::RasterScratch::new;
 const _: fn(types::AntiAliasingMode) -> [u8; 256] = vector::build_aa_lut;
 const _: fn(&vector::Outline, f32) -> glyph_contour::GlyphContour =
     vector::glyph_contour_from_outline;

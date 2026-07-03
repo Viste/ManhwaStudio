@@ -434,6 +434,12 @@ impl MangaApp {
             cache_pages_on_initial_load,
             Arc::clone(&decode_promotion_progress),
         );
+        // Warm the process-global text-render FontSystem pool off the GUI thread. The first lease
+        // pays a full system-font scan (~2.2s in a fresh process); doing it here on a detached
+        // background thread keeps it off the critical path so the user's first text render finds a
+        // warm system. Guarded by `Once` because `new` can run multiple times per process
+        // (launcher<->studio transitions) and we want at most one prewarm thread.
+        spawn_text_render_font_pool_prewarm();
         let mut canvas = CanvasView::default();
         let loaded_bubble_mode = BubbleMode::from_str(&project.canvas_settings.bubble_type);
         canvas.state.bubble_mode = BubbleMode::Hybrid;
@@ -2690,6 +2696,24 @@ fn option_label(options: &[AiBackendDeviceOption], selected_id: &str) -> String 
 /// more than `DECODE_AHEAD_WINDOW` pages ahead of it so decoded-but-unpromotable pages
 /// cannot pile up unbounded. The job queue is popped in ascending page-index order, which
 /// keeps that look-ahead window deadlock-free.
+/// Spawns a one-shot background thread that warms the process-global text-render FontSystem
+/// pool, at most once per process.
+///
+/// The first `FontSystem` lease scans the system font directories (~2.2s in a fresh process,
+/// ~32ms afterwards). Running that scan here, on a detached background thread, moves it off the
+/// GUI thread and off the first text render's critical path. Idempotent across repeated
+/// `MangaApp::new` calls (launcher<->studio transitions) via a `Once` guard, so no redundant
+/// prewarm threads are spawned.
+fn spawn_text_render_font_pool_prewarm() {
+    static PREWARM_ONCE: std::sync::Once = std::sync::Once::new();
+    PREWARM_ONCE.call_once(|| {
+        runtime_log::log_info("[app] prewarming text-render font system pool in background");
+        // Detached: the pool is process-global, the work is idempotent, and nothing on the GUI
+        // thread waits on it. We must never join this on the GUI thread.
+        thread::spawn(crate::tabs::typing::render_next::prewarm_font_system_pool);
+    });
+}
+
 fn spawn_loader_thread(
     mut pages: Vec<(usize, PathBuf)>,
     tx: SyncSender<LoaderEvent>,

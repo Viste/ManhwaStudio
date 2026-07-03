@@ -66,7 +66,7 @@ use crate::types::{
     KerningMode, RenderedTextImage, TextRenderParams, VerticalLineDirection,
 };
 use crate::vector::{
-    OutlineCache, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
+    OutlineCache, RasterScratch, build_aa_lut, glyph_contour_from_outline, rasterize_outline_into,
 };
 use cosmic_text::{Buffer, FontSystem, LayoutGlyph, SwashCache};
 
@@ -173,6 +173,8 @@ pub(crate) fn render_vertical_text(
     // same caches on both passes. Unused for non-Optical kerning modes.
     let mut outline_cache = OutlineCache::new();
     let mut contour_cache = OpticalContourCache::new();
+    // Reused per-glyph rasterizer buffers for the draw pass (see `RasterScratch`).
+    let mut raster_scratch = RasterScratch::new();
 
     // Global block rotation (vector level): turn the whole column block rigidly
     // about its centroid, matching the Ctrl+wheel overlay post-rotation but crisp.
@@ -372,6 +374,7 @@ pub(crate) fn render_vertical_text(
                     glyph_subpixel_offset(physical.cache_key),
                 );
                 rasterize_outline_into(
+                    &mut raster_scratch,
                     rgba.as_mut_slice(),
                     out_width as usize,
                     out_height as usize,

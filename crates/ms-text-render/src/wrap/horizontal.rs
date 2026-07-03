@@ -12,6 +12,15 @@ Main responsibilities:
 живут в `ms_text_util::segmentation` (см. `Segmenter::segment`); здесь
 остаётся только DP-подбор переносов поверх готовых блоков.
 
+DP-state contract:
+The paragraph block list is immutable during a solve. A DP state does NOT own the
+remaining blocks; it is `(start_index, split_tail)` over the original slice: the
+"remaining view" is `original[start_index..]`, optionally prefixed by `split_tail`
+(a mid-word hyphenation/emergency remainder). The common case (no split tail) borrows
+`&original[start_index..]` with zero allocation; only a mid-word split materializes a
+one-element-longer temporary view. This keeps memoization keys and state transitions
+O(1) in allocation instead of cloning/hashing the whole block suffix per DP state.
+
 Source:
 - `collect_line_break_candidates`
 - `wrap_text_with_targets*`
@@ -139,9 +148,18 @@ impl<'font, 'attrs> WrapScoringContext<'font, 'attrs> {
     }
 }
 
+/// Memoization key for `solve_wrap_paragraph_dp`.
+///
+/// Identifies a DP state by an index into the immutable paragraph block list plus an
+/// optional mid-word split tail, instead of cloning/hashing the whole remaining block
+/// suffix. `(start_index, split_tail)` uniquely determines the remaining view for a
+/// fixed block list: the view is `original[start_index..]`, prefixed by `split_tail`
+/// when present. The remaining fields carry the scoring context (line index, previous
+/// line units/width bucket, and the monotonic no-expand flag).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WrapMemoKey {
-    remaining_blocks: Vec<Block>,
+    start_index: usize,
+    split_tail: Option<Block>,
     line_idx: usize,
     prev_line_units: Option<usize>,
     prev_line_width_px: Option<u32>,
@@ -188,9 +206,16 @@ impl WrapSettings<'_> {
     }
 }
 
+/// Working state of one `solve_wrap_paragraph_dp` frame.
+///
+/// The remaining blocks are represented as `(start_index, split_tail)` over the
+/// immutable paragraph block list, not as an owned `Vec<Block>`: the remaining view is
+/// `original[start_index..]`, prefixed by `split_tail` when a preceding line ended on a
+/// mid-word split. See the file header "DP-state contract".
 #[derive(Debug, Clone)]
 struct SolveState {
-    remaining_blocks: Vec<Block>,
+    start_index: usize,
+    split_tail: Option<Block>,
     line_idx: usize,
     prev_line_units: Option<usize>,
     prev_line_width_px: Option<u32>,
@@ -282,8 +307,10 @@ fn wrap_paragraph_with_targets_scored(
     let start_line_idx = *global_line_idx;
     let mut memo = HashMap::<WrapMemoKey, Option<WrapParagraphSolution>>::new();
     let best = solve_wrap_paragraph_dp(
+        blocks.as_slice(),
         SolveState {
-            remaining_blocks: blocks.clone(),
+            start_index: 0,
+            split_tail: None,
             line_idx: start_line_idx,
             prev_line_units: None,
             prev_line_width_px: None,
@@ -317,20 +344,32 @@ fn wrap_paragraph_with_targets_scored(
     }
 }
 
+/// Solves the paragraph line-break DP over the immutable block list `blocks`.
+///
+/// `state` identifies the remaining view by `(start_index, split_tail)` (see
+/// `SolveState`); it must never own a block suffix. The common path (no split tail)
+/// borrows `&blocks[start_index..]` with zero allocation and only materializes a
+/// temporary view when a mid-word split tail is present. Returns the best scored
+/// solution for the remaining view, or `None` if it cannot be wrapped under the
+/// current constraints.
 fn solve_wrap_paragraph_dp(
+    blocks: &[Block],
     state: SolveState,
     settings: WrapSettings<'_>,
     scoring: &mut WrapScoringContext<'_, '_>,
     memo: &mut HashMap<WrapMemoKey, Option<WrapParagraphSolution>>,
 ) -> Option<WrapParagraphSolution> {
     let SolveState {
-        remaining_blocks,
+        start_index,
+        split_tail,
         line_idx,
         prev_line_units,
         prev_line_width_px,
         must_not_expand,
     } = state;
-    if remaining_blocks.is_empty() {
+    // The remaining view is empty only when nothing is left in the original suffix and
+    // there is no carried split tail; a split tail always contributes at least one block.
+    if split_tail.is_none() && start_index >= blocks.len() {
         return Some(WrapParagraphSolution {
             lines: Vec::new(),
             score: 0.0,
@@ -338,7 +377,8 @@ fn solve_wrap_paragraph_dp(
     }
 
     let memo_key = WrapMemoKey {
-        remaining_blocks: remaining_blocks.clone(),
+        start_index,
+        split_tail: split_tail.clone(),
         line_idx,
         prev_line_units,
         prev_line_width_px,
@@ -348,11 +388,24 @@ fn solve_wrap_paragraph_dp(
         return cached.clone();
     }
 
+    // Build the remaining view. Zero-alloc common path: borrow the original suffix.
+    // Only a leading split tail forces a one-element-longer temporary Vec (rare, right
+    // after a mid-word hyphenation/emergency split).
+    let suffix = &blocks[start_index.min(blocks.len())..];
+    let had_tail = split_tail.is_some();
+    let owned_view: Option<Vec<Block>> = split_tail.as_ref().map(|tail| {
+        let mut view = Vec::with_capacity(suffix.len().saturating_add(1));
+        view.push(tail.clone());
+        view.extend_from_slice(suffix);
+        view
+    });
+    let remaining_blocks: &[Block] = owned_view.as_deref().unwrap_or(suffix);
+
     let mut best: Option<WrapParagraphSolution> = None;
     let max_units = settings.line_target_units(line_idx);
     let target_width_px = settings.line_target_width_px(line_idx);
     let mut candidate_sets = Vec::<Vec<LineBreakCandidate>>::new();
-    let preferred = collect_line_break_candidates(remaining_blocks.as_slice(), max_units);
+    let preferred = collect_line_break_candidates(remaining_blocks, max_units);
     match settings.word_break_policy {
         Some(WordBreakPolicy::Aggressive) => {
             if !preferred.is_empty() {
@@ -360,7 +413,7 @@ fn solve_wrap_paragraph_dp(
             }
             if let Some(dicts) = settings.hyphen_dicts
                 && let Some(fallback) = build_dictionary_break_candidate(
-                    remaining_blocks.as_slice(),
+                    remaining_blocks,
                     max_units,
                     target_width_px,
                     settings.hanging_punctuation,
@@ -374,7 +427,7 @@ fn solve_wrap_paragraph_dp(
             }
             if candidate_sets.is_empty()
                 && let Some(fallback) = build_emergency_break_candidate(
-                    remaining_blocks.as_slice(),
+                    remaining_blocks,
                     max_units,
                     settings.hanging_punctuation,
                 )
@@ -386,7 +439,7 @@ fn solve_wrap_paragraph_dp(
             let mut candidates = preferred;
             if let Some(dicts) = settings.hyphen_dicts
                 && let Some(fallback) = build_dictionary_break_candidate(
-                    remaining_blocks.as_slice(),
+                    remaining_blocks,
                     max_units,
                     target_width_px,
                     settings.hanging_punctuation,
@@ -397,7 +450,7 @@ fn solve_wrap_paragraph_dp(
                 push_unique_line_break_candidate(&mut candidates, fallback);
             }
             if let Some(fallback) = build_emergency_break_candidate(
-                remaining_blocks.as_slice(),
+                remaining_blocks,
                 max_units,
                 settings.hanging_punctuation,
             ) {
@@ -441,14 +494,17 @@ fn solve_wrap_paragraph_dp(
                 continue;
             }
 
-            let remaining = apply_line_break_candidate(remaining_blocks.as_slice(), &candidate);
+            let (next_start_index, next_split_tail) =
+                apply_line_break_candidate(start_index, had_tail, &candidate);
             let candidate_width_bucket = candidate_width_px.round().max(0.0) as u32;
             let next_must_not_expand = must_not_expand
                 || shape_monotonic_phase(settings, line_idx) == ShapeMonotonicPhase::Contracting
                 || prev_line_units.is_some_and(|prev_units| candidate.line_units < prev_units);
             let Some(mut tail_solution) = solve_wrap_paragraph_dp(
+                blocks,
                 SolveState {
-                    remaining_blocks: remaining,
+                    start_index: next_start_index,
+                    split_tail: next_split_tail,
                     line_idx: line_idx.saturating_add(1),
                     prev_line_units: Some(candidate.line_units),
                     prev_line_width_px: Some(candidate_width_bucket),
@@ -498,15 +554,28 @@ fn approximate_wrap_paragraph_to_shape(
     settings: WrapSettings<'_>,
     scoring: &mut WrapScoringContext<'_, '_>,
 ) -> Vec<String> {
-    let mut remaining = blocks.to_vec();
+    // Index-based remaining view, matching the DP path: the view is `blocks[start_index..]`,
+    // optionally prefixed by `split_tail` after a mid-word split (common path is zero-alloc).
+    let mut start_index = 0usize;
+    let mut split_tail: Option<Block> = None;
     let mut lines = Vec::new();
     let mut line_idx = start_line_idx;
     let mut prev_line_width_px: Option<u32> = None;
 
-    while !remaining.is_empty() {
+    while split_tail.is_some() || start_index < blocks.len() {
+        let suffix = &blocks[start_index.min(blocks.len())..];
+        let had_tail = split_tail.is_some();
+        let owned_view: Option<Vec<Block>> = split_tail.as_ref().map(|tail| {
+            let mut view = Vec::with_capacity(suffix.len().saturating_add(1));
+            view.push(tail.clone());
+            view.extend_from_slice(suffix);
+            view
+        });
+        let remaining: &[Block] = owned_view.as_deref().unwrap_or(suffix);
+
         let max_units = settings.line_target_units(line_idx);
         let candidate = select_approximate_line_break_candidate(
-            remaining.as_slice(),
+            remaining,
             max_units,
             line_idx,
             prev_line_width_px,
@@ -515,13 +584,13 @@ fn approximate_wrap_paragraph_to_shape(
         );
         let Some(candidate) = candidate else {
             let Some(forced) =
-                build_overflow_block_candidate(remaining.as_slice(), settings.hanging_punctuation)
+                build_overflow_block_candidate(remaining, settings.hanging_punctuation)
             else {
                 break;
             };
             let forced_width =
                 scoring.measure_line_width_px(forced.line_text.as_str(), forced.line_units);
-            remaining = apply_line_break_candidate(remaining.as_slice(), &forced);
+            (start_index, split_tail) = apply_line_break_candidate(start_index, had_tail, &forced);
             lines.push(forced.line_text);
             prev_line_width_px = Some(forced_width.round().max(0.0) as u32);
             line_idx = line_idx.saturating_add(1);
@@ -529,7 +598,7 @@ fn approximate_wrap_paragraph_to_shape(
         };
         let candidate_width_px =
             scoring.measure_line_width_px(candidate.line_text.as_str(), candidate.line_units);
-        remaining = apply_line_break_candidate(remaining.as_slice(), &candidate);
+        (start_index, split_tail) = apply_line_break_candidate(start_index, had_tail, &candidate);
         lines.push(candidate.line_text);
         prev_line_width_px = Some(candidate_width_px.round().max(0.0) as u32);
         line_idx = line_idx.saturating_add(1);
@@ -603,6 +672,13 @@ fn build_overflow_block_candidate(
     })
 }
 
+/// Collects whole-block line-break candidates for the current remaining view `blocks`.
+///
+/// `blocks` is the DP "remaining view" (see the file header): either the borrowed
+/// original suffix or a temporary view whose first element is a split tail. For each
+/// prefix `blocks[..end]` that fits within `max_units`, emits a candidate consuming
+/// `end` view blocks with no mid-word split. `consumed_blocks` is therefore relative to
+/// this view and is translated back to an original index by `apply_line_break_candidate`.
 fn collect_line_break_candidates(
     blocks: &[Block],
     max_units: usize,
@@ -726,15 +802,29 @@ fn is_hyphenatable_wrap_block(block: &Block) -> bool {
     !block.text.chars().any(char::is_whitespace)
 }
 
+/// Advances the DP "remaining view" past a chosen line break without cloning the block
+/// suffix.
+///
+/// The view is `original[start_index..]`, prefixed by a split tail when `had_tail` is
+/// true. `candidate.consumed_blocks` counts blocks in that view, where the leading split
+/// tail (when present) is a virtual block absent from `original`. Returns the next
+/// `(start_index, split_tail)`: the new index is advanced by the consumed original
+/// blocks, and the new split tail is the candidate's mid-word remainder (if any), which
+/// becomes the leading virtual block of the next view.
 fn apply_line_break_candidate(
-    blocks: &[Block],
+    start_index: usize,
+    had_tail: bool,
     candidate: &LineBreakCandidate,
-) -> Vec<Block> {
-    let mut remaining = blocks[candidate.consumed_blocks..].to_vec();
-    if let Some(remainder) = candidate.split_remainder.as_ref() {
-        remaining.insert(0, remainder.clone());
-    }
-    remaining
+) -> (usize, Option<Block>) {
+    // consumed_blocks is relative to the current view. Its first element is the split
+    // tail when had_tail is true; that virtual block is not part of `original`, so it is
+    // subtracted before advancing the original-list index. consumed_blocks >= 1 and the
+    // subtracted offset is at most 1, so the arithmetic never underflows.
+    let consumed_in_original = candidate
+        .consumed_blocks
+        .saturating_sub(usize::from(had_tail));
+    let new_start_index = start_index.saturating_add(consumed_in_original);
+    (new_start_index, candidate.split_remainder.clone())
 }
 
 fn compute_line_fit_penalty(
@@ -1214,6 +1304,43 @@ mod tests {
         assert!(wrapped.used_approximate_shape_fallback);
         assert_eq!(wrapped.lines[0], "мо-");
         assert_eq!(wrapped.lines[1], "нолит");
+    }
+
+    #[test]
+    fn repeated_emergency_split_then_break_advances_index_correctly() {
+        // Exercises the index-based DP state: a long unhyphenatable word is emergency-split
+        // several lines in a row. Each split keeps `start_index` pinned and carries the
+        // remainder as `split_tail`; only after the word is exhausted does `start_index`
+        // advance to consume the following word. A regression in the split-tail index
+        // arithmetic would drop, duplicate, or misorder the tail lines or "rest".
+        let mut scoring = WrapScoringContext::fallback();
+        let wrapped = wrap_text_with_targets_scored(
+            "aaaaaaaaaa rest",
+            WrapSettings {
+                base_units: 3,
+                line_unit_targets: Some(&[3, 3, 3, 3, 6]),
+                line_width_targets_px: None,
+                line_order_phases: None,
+                strict_line_order: false,
+                allow_moderate_trees: false,
+                hanging_punctuation: false,
+                hyphen_dicts: None,
+                word_break_policy: Some(WordBreakPolicy::Minimal),
+                preserve_edge_spaces: false,
+            },
+            &mut scoring,
+        );
+
+        assert_eq!(
+            wrapped.lines,
+            vec![
+                "aaa-".to_string(),
+                "aaa-".to_string(),
+                "aa-".to_string(),
+                "aa".to_string(),
+                "rest".to_string(),
+            ]
+        );
     }
 
     #[test]

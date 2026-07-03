@@ -35,6 +35,19 @@
 !src/**/*.rs
 !src/**/MODULE_README.md
 
+# Workspace crates (ms-log, ms-text-util, ms-text-render). Publish source,
+# manifests, and agent docs only; the shared build output lives in the ignored
+# root target/ directory.
+!crates/
+!crates/**/
+!crates/**/*.rs
+!crates/**/*.toml
+!crates/**/*.md
+
+# ag-psd is a standalone project (github.com/Vasyanator/ag-psd-rs) consumed from
+# crates.io (ag-psd = "0.1.0"); its local dev checkout is not part of this repo.
+crates/ag-psd/
+
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/
 !modules/**/

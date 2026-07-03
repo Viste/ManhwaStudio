@@ -8,9 +8,20 @@ Main responsibilities:
 - инкапсулировать загрузку выбранного font face;
 - строить registry inline-шрифтов по label для rich-text path;
 - отделить font registration от layout/raster pipeline;
-- стать целевым местом для переноса логики `register_selected_font`.
+- дедуплицировать загрузку шрифтов через `FontFaceCache`, чтобы переиспользуемая
+  `FontSystem` из пула не накапливала дублирующиеся faces.
+
+Notes:
+Loading is cache-gated: `load_selected_font_from_path` and
+`build_inline_font_registry` take a `&mut FontFaceCache` (owned by the pooled
+`FontSystem`, see `font_system_pool.rs`). On a cache hit the file is NOT re-read
+and NOT re-loaded into fontdb; the previously loaded face IDs and metadata are
+reused. Default font families are still set every render (cheap, deterministic
+matching). The throwaway-DB helpers `resolve_font_postscript_name` /
+`resolve_font_family_name` are export-only and stay uncached.
 */
 
+use super::font_system_pool::{FileKey, FontFaceCache};
 use super::types::InlineFontEntry;
 use cosmic_text::{Attrs, Family, FontSystem, Stretch, Style, Weight, fontdb};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,31 +64,96 @@ pub struct InlineFontRegistryBuild {
     pub warnings: Vec<String>,
 }
 
+/// Loads the font at `font_path`, deduplicated through `font_cache`, and returns
+/// the metadata of the face at `selected_face_index`.
+///
+/// On a cache hit (this file already loaded into `font_system`'s db) the file is
+/// neither re-read nor re-registered — the previously loaded fontdb IDs and
+/// resolved face metadata are reused. On a miss the file is read, registered,
+/// and both the IDs and metadata are cached. Either way default families are set
+/// via `apply_default_families` so matching stays deterministic on a reused
+/// system (a no-family face restores the system's pristine defaults).
+///
+/// Determinism guard: on a miss, if a DIFFERENT already-loaded file shares this
+/// face's `(family, weight, style, stretch)`, the cache is marked tainted so the
+/// pool drops the system instead of reusing it (see `font_system_pool.rs`).
+///
+/// # Errors
+/// Returns an error string if the file cannot be read or fontdb cannot parse it.
 pub fn load_selected_font_from_path(
     font_system: &mut FontSystem,
+    font_cache: &mut FontFaceCache,
     font_path: &Path,
     selected_face_index: usize,
 ) -> Result<RegisteredFontFace, String> {
+    // Derive the cache key from metadata FIRST so a hit avoids `fs::read`.
+    let key = FileKey::from_path(font_path);
+
+    if font_cache.loaded_ids(&key).is_some() {
+        // Cache hit: faces are already in this system's db. Reuse resolved
+        // metadata, or resolve it from the already-loaded IDs on first request
+        // for this face index.
+        let selected = if let Some(face) = font_cache.cached_meta(&key, selected_face_index) {
+            face.clone()
+        } else {
+            // `loaded_ids` is present, so this re-borrow yields the same slice.
+            let ids = font_cache
+                .loaded_ids(&key)
+                .ok_or_else(|| "font cache lost its loaded face IDs".to_string())?
+                .to_vec();
+            let resolved = resolve_registered_face(font_system, &ids, selected_face_index);
+            font_cache.store_meta(key.clone(), selected_face_index, resolved.clone());
+            resolved
+        };
+        apply_default_families(font_system, font_cache, &selected);
+        return Ok(selected);
+    }
+
+    // Cache miss: read and register the file into this system's db.
     let font_bytes = fs::read(font_path).map_err(|error| {
         format!(
             "не удалось прочитать шрифт {}: {error}",
             font_path.display()
         )
     })?;
-    register_selected_font(font_system, font_bytes, selected_face_index)
-}
-
-fn register_selected_font(
-    font_system: &mut FontSystem,
-    font_bytes: Vec<u8>,
-    selected_face_index: usize,
-) -> Result<RegisteredFontFace, String> {
     let source = fontdb::Source::Binary(Arc::new(font_bytes));
     let loaded_ids = font_system.db_mut().load_font_source(source);
     if loaded_ids.is_empty() {
         return Err("fontdb не смог распарсить файл шрифта".to_string());
     }
 
+    let selected = resolve_registered_face(font_system, &loaded_ids, selected_face_index);
+    // Determinism guard: if a DIFFERENT already-loaded file declares the same
+    // (family, weight, style, stretch), `Family::Name` matching becomes
+    // history-dependent on this reused system. Taint it so the pool drops it and
+    // never serves a future render (the residual is documented in the pool's
+    // file header). Detect BEFORE storing this file's metadata so we only compare
+    // against prior files.
+    if font_cache.collides_with_other_file(&key, &selected) {
+        font_cache.mark_tainted();
+        ms_log::runtime_log::log_warn(format!(
+            "render font family collision: '{}' (face {selected_face_index}) shares family '{}' \
+             with an earlier font in the reused FontSystem; dropping the system after this render \
+             to keep matching deterministic",
+            font_path.display(),
+            selected.family_name.as_deref().unwrap_or("<none>"),
+        ));
+    }
+    // `load_font_source` returns a `TinyVec`; store an owned `Vec` in the cache.
+    font_cache.store_loaded(key.clone(), loaded_ids.to_vec());
+    font_cache.store_meta(key, selected_face_index, selected.clone());
+    apply_default_families(font_system, font_cache, &selected);
+    Ok(selected)
+}
+
+/// Reads the face metadata (family/style/weight/stretch) of the face at
+/// `selected_face_index` among `loaded_ids`, falling back to the first ID when
+/// the index is out of range. Does not mutate default families.
+fn resolve_registered_face(
+    font_system: &FontSystem,
+    loaded_ids: &[fontdb::ID],
+    selected_face_index: usize,
+) -> RegisteredFontFace {
     let mut selected = RegisteredFontFace {
         family_name: None,
         style: None,
@@ -85,10 +161,14 @@ fn register_selected_font(
         stretch: None,
     };
 
-    let face_id = loaded_ids
+    let Some(face_id) = loaded_ids
         .get(selected_face_index)
         .copied()
-        .unwrap_or(loaded_ids[0]);
+        .or_else(|| loaded_ids.first().copied())
+    else {
+        // Empty ID list is prevented by the caller, but stay panic-free.
+        return selected;
+    };
     if let Some(face) = font_system.db().face(face_id) {
         selected.family_name = face
             .families
@@ -105,7 +185,22 @@ fn register_selected_font(
         selected.weight = Some(face.weight);
         selected.stretch = Some(face.stretch);
     }
+    selected
+}
 
+/// Makes cosmic-text's generic-family matching deterministic on a reused
+/// `FontSystem` regardless of pool history. Runs every render (cheap).
+///
+/// When `selected` has a family name, installs it as ALL five generic default
+/// families so `Family::SansSerif`/etc. resolve to the selected font. When it has
+/// NO family name, RESTORES the system's pristine defaults (captured at creation
+/// in `font_cache`) so matching falls back to what a fresh `FontSystem` would use
+/// instead of a prior render's family that still lingers in the reused db.
+fn apply_default_families(
+    font_system: &mut FontSystem,
+    font_cache: &FontFaceCache,
+    selected: &RegisteredFontFace,
+) {
     if let Some(family) = selected.family_name.as_ref() {
         let db = font_system.db_mut();
         db.set_sans_serif_family(family.clone());
@@ -113,9 +208,12 @@ fn register_selected_font(
         db.set_monospace_family(family.clone());
         db.set_cursive_family(family.clone());
         db.set_fantasy_family(family.clone());
+    } else {
+        // No family name: a prior render's family may still be set as the
+        // generic defaults on this reused system. Restore the pristine defaults
+        // so identical params render identically regardless of pool history.
+        font_cache.restore_pristine_defaults(font_system);
     }
-
-    Ok(selected)
 }
 
 /// Загружает файл шрифта в свежую `fontdb::Database` и возвращает реальное
@@ -169,8 +267,12 @@ pub fn normalize_inline_font_label(label: &str) -> String {
     label.trim().to_ascii_lowercase()
 }
 
+/// Builds the inline-font registry for the requested labels, loading each font
+/// through the shared `font_cache` so a reused `FontSystem` does not re-register
+/// duplicate faces. Unknown labels and load failures become warnings, not errors.
 pub fn build_inline_font_registry(
     font_system: &mut FontSystem,
+    font_cache: &mut FontFaceCache,
     available_fonts: &[InlineFontEntry],
     requested_labels: &[String],
 ) -> InlineFontRegistryBuild {
@@ -196,7 +298,12 @@ pub fn build_inline_font_registry(
             continue;
         };
 
-        match load_selected_font_from_path(font_system, &entry.font_path, entry.face_index) {
+        match load_selected_font_from_path(
+            font_system,
+            font_cache,
+            &entry.font_path,
+            entry.face_index,
+        ) {
             Ok(face) => {
                 build.registry.insert(label, face);
             }
@@ -209,4 +316,71 @@ pub fn build_inline_font_registry(
     }
 
     build
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegisteredFontFace, apply_default_families};
+    use crate::font_system_pool::FontFaceCache;
+    use cosmic_text::{Family, FontSystem};
+
+    /// Builds a `RegisteredFontFace` carrying only the given family name (no
+    /// explicit style/weight/stretch), matching the metadata shape used on the
+    /// no-attribute paths.
+    fn face_with_family(family: Option<&str>) -> RegisteredFontFace {
+        RegisteredFontFace {
+            family_name: family.map(str::to_string),
+            style: None,
+            weight: None,
+            stretch: None,
+        }
+    }
+
+    #[test]
+    fn apply_default_families_sets_named_and_restores_pristine() {
+        let mut system = FontSystem::new();
+        // Capture the pristine defaults the FRESH system uses, exactly as a
+        // pooled system does at creation time.
+        let cache = FontFaceCache::for_system(&system);
+        let pristine_sans = system.db().family_name(&Family::SansSerif).to_string();
+        let pristine_serif = system.db().family_name(&Family::Serif).to_string();
+        let pristine_mono = system.db().family_name(&Family::Monospace).to_string();
+        let pristine_cursive = system.db().family_name(&Family::Cursive).to_string();
+        let pristine_fantasy = system.db().family_name(&Family::Fantasy).to_string();
+        assert!(
+            !pristine_sans.is_empty(),
+            "a fresh FontSystem must expose a non-empty sans-serif default"
+        );
+
+        // Some(family): every generic default becomes that family.
+        let named = face_with_family(Some("Ms Determinism Test Family"));
+        apply_default_families(&mut system, &cache, &named);
+        for family in [
+            Family::SansSerif,
+            Family::Serif,
+            Family::Monospace,
+            Family::Cursive,
+            Family::Fantasy,
+        ] {
+            assert_eq!(
+                system.db().family_name(&family),
+                "Ms Determinism Test Family",
+                "a named face must install its family as every generic default"
+            );
+        }
+
+        // None: the pristine defaults are restored, undoing the prior render's
+        // family so a nameless face matches fresh-system behavior.
+        let nameless = face_with_family(None);
+        apply_default_families(&mut system, &cache, &nameless);
+        assert_eq!(
+            system.db().family_name(&Family::SansSerif),
+            pristine_sans,
+            "a nameless face must restore the pristine sans-serif default"
+        );
+        assert_eq!(system.db().family_name(&Family::Serif), pristine_serif);
+        assert_eq!(system.db().family_name(&Family::Monospace), pristine_mono);
+        assert_eq!(system.db().family_name(&Family::Cursive), pristine_cursive);
+        assert_eq!(system.db().family_name(&Family::Fantasy), pristine_fantasy);
+    }
 }
