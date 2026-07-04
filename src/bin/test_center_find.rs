@@ -817,7 +817,8 @@ impl OverlayTestApp {
 }
 
 impl eframe::App for OverlayTestApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         if ctx.input(|i| i.key_pressed(egui::Key::C)) {
             self.trigger_overlay_center_auto_align();
         }
@@ -828,7 +829,7 @@ impl eframe::App for OverlayTestApp {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading(APP_TITLE);
             ui.label(format!("Background: {BACKGROUND_IMAGE_PATH}"));
             ui.label(format!("Overlay: {OVERLAY_IMAGE_PATH}"));

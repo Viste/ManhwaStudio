@@ -205,7 +205,7 @@ impl<'a> SpellcheckedTextEdit<'a> {
     }
 
     #[must_use]
-    pub fn id_salt(mut self, salt: impl Hash) -> Self {
+    pub fn id_salt(mut self, salt: impl Hash + std::fmt::Debug) -> Self {
         self.id = Some(Id::new(salt));
         self
     }
@@ -269,7 +269,9 @@ impl<'a> SpellcheckedTextEdit<'a> {
 
 impl Widget for SpellcheckedTextEdit<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        self.show(ui).response
+        // egui 0.35: `TextEditOutput::response` is an `AtomLayoutResponse`; expose its
+        // inner `Response` as the widget response.
+        self.show(ui).response.response
     }
 }
 
@@ -327,7 +329,8 @@ pub fn misspelled_word_at_pointer(ui: &Ui, output: &TextEditOutput, text: &str) 
     let pointer_pos = output.response.interact_pointer_pos()?;
     let local_pos = pointer_pos - output.galley_pos;
     let cursor = output.galley.cursor_from_pos(local_pos);
-    let byte_index = char_index_to_byte_index(text, cursor.index);
+    // epaint 0.35 `CCursor::index` is a `CharIndex`; take the inner character count.
+    let byte_index = char_index_to_byte_index(text, cursor.index.0);
     let tokens = collect_word_tokens(text);
     let statuses = statuses_for_tokens(ui, &tokens);
     let token_index = token_index_at_byte(&tokens, byte_index)?;
@@ -361,7 +364,8 @@ fn push_section(job: &mut LayoutJob, range: Range<usize>, format: TextFormat) {
     }
     job.sections.push(egui::text::LayoutSection {
         leading_space: 0.0,
-        byte_range: range,
+        // epaint 0.35 types layout ranges as `Range<ByteIndex>`; wrap the byte offsets.
+        byte_range: egui::text::ByteIndex(range.start)..egui::text::ByteIndex(range.end),
         format,
     });
 }

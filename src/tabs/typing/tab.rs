@@ -533,8 +533,8 @@ impl TypingTabState {
             return false;
         }
 
-        let pointer_over_area = ctx.is_pointer_over_area();
-        let popup_open = ctx.is_popup_open();
+        let pointer_over_area = crate::input_util::pointer_over_floating_area(ctx);
+        let popup_open = ctx.any_popup_open();
         ctx.input(|input| {
             input.pointer.primary_clicked()
                 && input
@@ -561,11 +561,11 @@ impl TypingTabState {
             return false;
         }
 
-        let (shift_down, raw_scroll_delta, primary_down, hover_pos, interact_pos) =
+        let (shift_down, smooth_scroll_delta, primary_down, hover_pos, interact_pos) =
             ctx.input(|input| {
                 (
                     input.modifiers.shift,
-                    input.raw_scroll_delta,
+                    input.smooth_scroll_delta,
                     input.pointer.primary_down(),
                     input.pointer.hover_pos(),
                     input.pointer.interact_pos(),
@@ -582,10 +582,10 @@ impl TypingTabState {
 
         // Match panel wheel behavior: use raw delta only (no smooth inertia)
         // and keep one discrete step per wheel event.
-        let mut wheel_delta = raw_scroll_delta.y;
+        let mut wheel_delta = smooth_scroll_delta.y;
         if wheel_delta.abs() <= f32::EPSILON {
             // Some backends convert Shift+wheel into horizontal scroll.
-            wheel_delta = raw_scroll_delta.x;
+            wheel_delta = smooth_scroll_delta.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
@@ -598,7 +598,6 @@ impl TypingTabState {
 
         ctx.input_mut(|input| {
             input.smooth_scroll_delta = Vec2::ZERO;
-            input.raw_scroll_delta = Vec2::ZERO;
         });
         true
     }
@@ -621,11 +620,11 @@ impl TypingTabState {
             return false;
         }
 
-        let (shift_down, raw_scroll_delta, primary_down, hover_pos, interact_pos) =
+        let (shift_down, smooth_scroll_delta, primary_down, hover_pos, interact_pos) =
             ctx.input(|input| {
                 (
                     input.modifiers.shift,
-                    input.raw_scroll_delta,
+                    input.smooth_scroll_delta,
                     input.pointer.primary_down(),
                     input.pointer.hover_pos(),
                     input.pointer.interact_pos(),
@@ -640,9 +639,9 @@ impl TypingTabState {
             return false;
         }
 
-        let mut wheel_delta = raw_scroll_delta.y;
+        let mut wheel_delta = smooth_scroll_delta.y;
         if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll_delta.x;
+            wheel_delta = smooth_scroll_delta.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
@@ -658,7 +657,6 @@ impl TypingTabState {
 
         ctx.input_mut(|input| {
             input.smooth_scroll_delta = Vec2::ZERO;
-            input.raw_scroll_delta = Vec2::ZERO;
         });
         true
     }

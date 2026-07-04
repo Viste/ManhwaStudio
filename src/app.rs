@@ -28,7 +28,7 @@ App/frame flow:
 - `new`: builds models, tabs, and input manager registrations.
 - `new`: wires shared models (`bubbles`, `clean_overlays`, `text_mask`) between tabs.
 - `new`: also starts shared AI-backend health probe and wires it into Settings/Translation tabs.
-- `update` (eframe::App): frame tick (poll workers, draw active tab, dispatch hotkeys).
+- `ui` (eframe::App, egui 0.35): frame tick (poll workers, draw active tab, dispatch hotkeys).
 - `dispatch_hotkeys` + `execute_hotkey_command`: execute `InputManagerV2` commands.
 
 Hotkeys:
@@ -36,7 +36,7 @@ Hotkeys:
 - Cleaning canvas zoom commands.
 
 Profiling (optional, behind the `profiling` cargo feature):
-- `update` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
+- `ui` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
   per-frame phases (worker polling, GPU upload, active-tab draw). The puffin_egui profiler
   window is shown while the feature is compiled in. All puffin references are gated behind
   `#[cfg(feature = "profiling")]` so the default build pulls in no puffin and has zero overhead.
@@ -2247,7 +2247,15 @@ fn build_system_font_definitions(
 // by `AiBackendSupervisor` in `run_main`), so `MangaApp` no longer stops them on drop.
 
 impl eframe::App for MangaApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35 replaced `App::update(&Context, …)` with `App::ui(&mut Ui, …)`: the framework
+        // now hands us the window-root `Ui` that fills the whole window. The top-level panels below
+        // (`Panel::top`, `CentralPanel`) build on this `ui`; floating windows/prompts and every
+        // context-level call keep using a borrowed `Context` handle cloned from it. Cloning (Arc
+        // inside) is required so the context handle does not keep `ui` borrowed while the root
+        // panels mutably borrow it.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // Advance the puffin frame and open the top-level scope for this frame. `new_frame`
         // must run exactly once per frame before any `profile_scope!` so recorded scopes are
         // attributed to the correct frame; the scope guard stays alive for the whole body.
@@ -2346,7 +2354,7 @@ impl eframe::App for MangaApp {
             ctx.request_repaint();
         }
 
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+        egui::Panel::top("top_bar").show(ui, |ui| {
             self.draw_tab_bar(ui);
         });
 
@@ -2384,7 +2392,7 @@ impl eframe::App for MangaApp {
                 let canvas = &mut self.canvas;
                 let hooks = &mut self.translation_tab;
 
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let mut source_upload_budget =
                         SourceTextureUploadBudget::source_page_reupload_default();
                     canvas.draw(CanvasDrawParams {
@@ -2409,7 +2417,7 @@ impl eframe::App for MangaApp {
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
                 let cleaning = &mut self.cleaning_tab;
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     cleaning.draw(ctx, ui, project, page_infos, textures, status);
                 });
             }
@@ -2423,7 +2431,7 @@ impl eframe::App for MangaApp {
                 let page_infos = &self.page_infos;
                 let textures = &mut self.textures;
                 let typing = &mut self.typing_tab;
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     typing.draw(ctx, ui, project, page_infos, textures, status);
                 });
             }
@@ -2431,7 +2439,7 @@ impl eframe::App for MangaApp {
                 let project = &self.project;
                 let ps_editor = &mut self.ps_editor_tab;
                 ps_editor.handle_hotkeys(ctx, project);
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ps_editor.draw(ctx, ui, project);
                 });
             }
@@ -2439,7 +2447,7 @@ impl eframe::App for MangaApp {
                 let project = &self.project;
                 let tab = &mut self.characters_tab;
                 let mut actions = Vec::new();
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     actions = tab.draw(ctx, ui, project);
                 });
                 for action in actions {
@@ -2460,7 +2468,7 @@ impl eframe::App for MangaApp {
                 let project = &self.project;
                 let tab = &mut self.terms_tab;
                 let mut changed = false;
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     changed = tab.draw(ctx, ui, project);
                 });
                 if changed {
@@ -2470,15 +2478,15 @@ impl eframe::App for MangaApp {
             AppTab::Notes => {
                 let project = &self.project;
                 let tab = &mut self.notes_tab;
-                egui::CentralPanel::default().show(ctx, |ui| tab.draw(ctx, ui, project));
+                egui::CentralPanel::default().show(ui, |ui| tab.draw(ctx, ui, project));
             }
             AppTab::Settings => {
                 let settings_tab = &mut self.settings_tab;
                 let hotkeys_v2 = &mut self.input_manager_v2;
-                egui::CentralPanel::default().show(ctx, |ui| settings_tab.draw(ui, hotkeys_v2));
+                egui::CentralPanel::default().show(ui, |ui| settings_tab.draw(ui, hotkeys_v2));
             }
             AppTab::Wiki => {
-                egui::CentralPanel::default().show(ctx, |ui| self.wiki_tab.draw(ui));
+                egui::CentralPanel::default().show(ui, |ui| self.wiki_tab.draw(ui));
             }
         }
         // Close the active-tab draw scope before the post-draw GPU trim / memory phases.

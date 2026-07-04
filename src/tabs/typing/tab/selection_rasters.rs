@@ -274,17 +274,19 @@ impl TypingTextOverlayLayer {
             return;
         }
 
-        let (ctrl_or_command, raw_scroll_delta_y) = ui.ctx().input(|input| {
+        let (ctrl_or_command, scroll_delta_y) = ui.ctx().input(|input| {
             (
                 input.modifiers.ctrl || input.modifiers.command,
-                input.raw_scroll_delta.y,
+                // Raw wheel: this rotation is Ctrl-gated, and egui zeroes
+                // `smooth_scroll_delta` while Ctrl/Cmd is held.
+                crate::input_util::raw_wheel_delta(input).y,
             )
         });
-        if !ctrl_or_command || raw_scroll_delta_y.abs() <= f32::EPSILON {
+        if !ctrl_or_command || scroll_delta_y.abs() <= f32::EPSILON {
             return;
         }
 
-        let steps: f32 = if raw_scroll_delta_y > 0.0 { 1.0 } else { -1.0 };
+        let steps: f32 = if scroll_delta_y > 0.0 { 1.0 } else { -1.0 };
         let delta_deg: f32 = steps * 2.0;
         let delta_rad = delta_deg.to_radians();
 
@@ -322,7 +324,6 @@ impl TypingTextOverlayLayer {
 
         ui.ctx().input_mut(|input| {
             input.smooth_scroll_delta = Vec2::ZERO;
-            input.raw_scroll_delta = Vec2::ZERO;
         });
         self.mark_overlay_geometry_changed(selected_idx, false);
         self.request_overlay_placement_save();
@@ -330,7 +331,7 @@ impl TypingTextOverlayLayer {
 
     pub(super) fn try_scale_selected_overlay_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
         // Do not hijack typing in any focused text field.
-        if ui.ctx().wants_keyboard_input() {
+        if ui.ctx().egui_wants_keyboard_input() {
             return;
         }
 
@@ -385,7 +386,7 @@ impl TypingTextOverlayLayer {
 
     /// Scale the selected raster with the `-` / `=` / `0` keys (parity with the overlay shortcut).
     pub(super) fn try_scale_selected_raster_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
-        if ui.ctx().wants_keyboard_input() {
+        if ui.ctx().egui_wants_keyboard_input() {
             return;
         }
         let Some(idx) = self.selected_raster_idx else {
@@ -957,7 +958,7 @@ impl TypingTextOverlayLayer {
                     && i.pointer
                         .interact_pos()
                         .is_some_and(|p| image_rect.contains(p))
-            }) && !ui.ctx().is_pointer_over_area();
+            }) && !crate::input_util::pointer_over_floating_area(ui.ctx());
             if clicked_empty {
                 self.selected_raster_idx = None;
                 self.transform_mode_raster_idx = None;

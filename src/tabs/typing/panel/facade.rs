@@ -284,7 +284,7 @@ impl TypingTopPanelState {
                                                 .id_salt("typing_vertical_params_hscroll")
                                                 .scroll_source(egui::scroll_area::ScrollSource {
                                                     scroll_bar: true,
-                                                    drag: true,
+                                                    drag: egui::scroll_area::DragScroll::Always,
                                                     mouse_wheel: false,
                                                 })
                                                 .auto_shrink([false, true])

@@ -964,7 +964,7 @@ impl RegionEditToolBase {
 
     pub fn draw_region_editor_collapsible_section<AddContents>(
         ui: &mut egui::Ui,
-        id_source: impl std::hash::Hash,
+        id_source: impl std::hash::Hash + std::fmt::Debug,
         title: &str,
         default_open: bool,
         add_contents: AddContents,
@@ -1229,7 +1229,9 @@ impl RegionEditToolBase {
                 i.pointer.interact_pos(),
                 i.key_down(egui::Key::Z),
                 i.pointer.primary_down(),
-                i.smooth_scroll_delta.y + i.raw_scroll_delta.y,
+                // Raw wheel: stays non-zero under Ctrl/Cmd (egui zeroes
+                // `smooth_scroll_delta` there, diverting the wheel into zoom).
+                crate::input_util::raw_wheel_delta(i).y,
             )
         });
         let ctrl_or_command = mods.ctrl || mods.command;
@@ -1250,7 +1252,6 @@ impl RegionEditToolBase {
             // Keep wheel delta from being interpreted as content scroll in the same frame.
             ctx.input_mut(|i| {
                 i.smooth_scroll_delta = egui::Vec2::ZERO;
-                i.raw_scroll_delta = egui::Vec2::ZERO;
             });
         }
 
@@ -1274,7 +1275,7 @@ impl RegionEditToolBase {
             editor.zoom_drag_last_x = pos.x;
         }
 
-        if zoom_modifier_down && inside_window && !ctx.wants_keyboard_input() {
+        if zoom_modifier_down && inside_window && !ctx.egui_wants_keyboard_input() {
             let mut zoom_in = false;
             let mut zoom_out = false;
             let mut zoom_reset = false;
@@ -2165,7 +2166,7 @@ impl RegionMaskInpaintToolBase {
                 );
             }
 
-            let (primary_down, secondary_down, mods, z_down, smooth_scroll, raw_scroll) =
+            let (primary_down, secondary_down, mods, z_down, smooth_scroll) =
                 ui.ctx().input(|i| {
                     (
                         i.pointer.primary_down(),
@@ -2173,7 +2174,6 @@ impl RegionMaskInpaintToolBase {
                         i.modifiers,
                         i.key_down(egui::Key::Z),
                         i.smooth_scroll_delta,
-                        i.raw_scroll_delta,
                     )
                 });
             let zoom_modifier_down = mods.ctrl || mods.command || z_down;
@@ -2228,15 +2228,11 @@ impl RegionMaskInpaintToolBase {
             }
 
             if response.hovered() {
+                // Shift+wheel adjusts the brush; some backends deliver it as
+                // horizontal scroll, so fall back to the X component.
                 let mut wheel_delta = smooth_scroll.y;
                 if wheel_delta.abs() <= f32::EPSILON {
-                    wheel_delta = raw_scroll.y;
-                }
-                if wheel_delta.abs() <= f32::EPSILON {
                     wheel_delta = smooth_scroll.x;
-                }
-                if wheel_delta.abs() <= f32::EPSILON {
-                    wheel_delta = raw_scroll.x;
                 }
                 if mods.shift && !zoom_modifier_down && brush_base.handle_wheel(wheel_delta, mods) {
                     ui.ctx().request_repaint();

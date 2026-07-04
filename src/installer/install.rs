@@ -473,7 +473,11 @@ impl ExistingInstallApp {
 
 #[cfg(target_os = "windows")]
 impl eframe::App for ExistingInstallApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`; keep a borrowed `Context` handle for
+        // the viewport-command calls, and build the root `CentralPanel` on `ui` below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let mut queued_events = Vec::new();
         if let Some(rx) = &self.rx {
             while let Ok(event) = rx.try_recv() {
@@ -496,7 +500,7 @@ impl eframe::App for ExistingInstallApp {
         }
 
         let mut close_window = false;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("Программа уже установлена. Чем-то помочь?");
             });
@@ -845,7 +849,11 @@ impl InstallerApp {
 }
 
 impl eframe::App for InstallerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`; keep a borrowed `Context` handle for
+        // viewport commands / repaint scheduling, and build the root `CentralPanel` on `ui` below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let mut queued_events = Vec::new();
         if let Some(rx) = &self.rx {
             while let Ok(event) = rx.try_recv() {
@@ -941,7 +949,7 @@ impl eframe::App for InstallerApp {
         let mut selected_dependency_profile: Option<InstallDependencyProfile> = None;
         let mut requested_start_install = false;
         let mut finish_outcome: Option<InstallerOutcome> = None;
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("ManhwaStudio");
             });
@@ -1383,7 +1391,11 @@ impl UninstallApp {
 
 #[cfg(target_os = "windows")]
 impl eframe::App for UninstallApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`; keep a borrowed `Context` handle for
+        // viewport commands / repaint scheduling, and build the root `CentralPanel` on `ui` below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         while let Ok(event) = self.rx.try_recv() {
             match event {
                 UninstallEvent::Progress {
@@ -1415,7 +1427,7 @@ impl eframe::App for UninstallApp {
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("Удаление ManhwaStudio");
             });

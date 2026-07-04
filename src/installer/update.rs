@@ -513,11 +513,15 @@ impl UpdateApp {
 }
 
 impl eframe::App for UpdateApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`; keep a borrowed `Context` handle for
+        // worker polling / repaint scheduling, and build the root `CentralPanel` on `ui` below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.poll_check_result();
         self.poll_worker_events(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.page {
+        egui::CentralPanel::default().show(ui, |ui| match self.page {
             UpdatePage::Check => self.draw_check_page(ui),
             UpdatePage::Running => self.draw_running_page(ui),
             UpdatePage::TorchChoice => self.draw_torch_choice_page(ui),

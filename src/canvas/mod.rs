@@ -739,7 +739,7 @@ impl CanvasView {
     /// counts. Mirrors egui's bar geometry (see `render_scrollbar_marks` and the
     /// `marked_scroll` widget).
     fn cache_scrollbar_rects(&mut self, ctx: &egui::Context, inner: Rect, content: Vec2) {
-        let scroll = ctx.style().spacing.scroll;
+        let scroll = ctx.global_style().spacing.scroll;
         let thickness = scroll.bar_width + scroll.bar_inner_margin + scroll.bar_outer_margin;
         // Match egui's own "is the bar drawn" test (see `render_scrollbar_marks`).
         let v_overflow = content.y > inner.height() + 0.5;
@@ -1502,7 +1502,9 @@ impl CanvasView {
         let (mods, wheel_delta_y, hover_pos, interact_pos, z_down, primary_down) = ctx.input(|i| {
             (
                 i.modifiers,
-                i.smooth_scroll_delta.y + i.raw_scroll_delta.y,
+                // Raw wheel: stays non-zero under Ctrl/Cmd, where egui zeroes
+                // `smooth_scroll_delta` (it diverts Ctrl+wheel into `zoom_delta`).
+                crate::input_util::raw_wheel_delta(i).y,
                 i.pointer.hover_pos(),
                 i.pointer.interact_pos(),
                 i.key_down(egui::Key::Z),
@@ -1515,7 +1517,7 @@ impl CanvasView {
         let inside_canvas = pointer_pos
             .map(|p| canvas_rect.contains(p))
             .unwrap_or(false);
-        if self.editable && !ctx.wants_keyboard_input() {
+        if self.editable && !ctx.egui_wants_keyboard_input() {
             let command_shift_mods = egui::Modifiers {
                 command: true,
                 shift: true,
@@ -1537,7 +1539,7 @@ impl CanvasView {
             .bubble_runtime
             .selected_bubble
             .is_some_and(|bid| self.bubble_runtime.runtime_bubbles.contains_key(&bid));
-        let keyboard_input_active = ctx.wants_keyboard_input();
+        let keyboard_input_active = ctx.egui_wants_keyboard_input();
         let can_duplicate_shortcut = self.editable && has_focused_bubble && !keyboard_input_active;
         let duplicate_shortcut = ctx.input_mut(|i| {
             if can_duplicate_shortcut {
@@ -1587,7 +1589,7 @@ impl CanvasView {
         if !self.scene.zoom_blocked
             && zoom_modifier_down
             && inside_canvas
-            && !ctx.wants_keyboard_input()
+            && !ctx.egui_wants_keyboard_input()
         {
             let mut zoom_in = false;
             let mut zoom_out = false;

@@ -954,7 +954,12 @@ impl TypingCreatePanelState {
             return;
         }
 
-        if let Some(range) = cursor_range.map(|range| range.as_sorted_char_range()) {
+        // egui 0.35 returns a `Range<CharIndex>` from `as_sorted_char_range`; the stored
+        // selection range is plain `usize` char offsets, so unwrap the `CharIndex` newtype.
+        if let Some(range) = cursor_range
+            .map(|range| range.as_sorted_char_range())
+            .map(|range| range.start.0..range.end.0)
+        {
             if range.start < range.end {
                 self.text_selection_char_range = Some(range);
             } else if response.clicked() || response.dragged() {

@@ -88,7 +88,11 @@ impl BatchProcessingWindowState {
 
     /// Main entry point called every frame from the launcher.
     /// Returns false when the window should close.
-    pub fn show(&mut self, ctx: &egui::Context, _class: ViewportClass) -> bool {
+    pub fn show(&mut self, ui: &mut egui::Ui, _class: ViewportClass) -> bool {
+        // The viewport callback hands us a `Ui`; derive the child viewport `Context`
+        // (cheap Arc clone) for input polling and executor progress repaints.
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
         if ctx.input(|input| input.viewport().close_requested()) {
             return false;
         }
@@ -98,7 +102,7 @@ impl BatchProcessingWindowState {
         let mut keep_open = true;
 
         // ── Top toolbar ────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("bp_toolbar").show(ctx, |ui| {
+        egui::Panel::top("bp_toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Сохранить").clicked() {
                     self.save_graph(ctx);
@@ -129,9 +133,9 @@ impl BatchProcessingWindowState {
         });
 
         // ── Status bar ─────────────────────────────────────────────────────
-        egui::TopBottomPanel::bottom("bp_status")
-            .exact_height(STATUS_BAR_HEIGHT)
-            .show(ctx, |ui| {
+        egui::Panel::bottom("bp_status")
+            .exact_size(STATUS_BAR_HEIGHT)
+            .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     if self.is_running {
                         ui.spinner();
@@ -150,9 +154,9 @@ impl BatchProcessingWindowState {
             });
 
         // ── Left panel ─────────────────────────────────────────────────────
-        egui::SidePanel::left("bp_left_panel")
-            .exact_width(LEFT_PANEL_WIDTH)
-            .show(ctx, |ui| {
+        egui::Panel::left("bp_left_panel")
+            .exact_size(LEFT_PANEL_WIDTH)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui.selectable_label(self.left_tab == 0, "Ноды").clicked() {
                         self.left_tab = 0;
@@ -173,7 +177,7 @@ impl BatchProcessingWindowState {
             });
 
         // ── Central canvas ─────────────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let actions = self
                 .canvas
                 .show(ui, &mut self.graph, &self.defs, self.active_node_id);

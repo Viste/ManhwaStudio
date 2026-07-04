@@ -45,6 +45,7 @@ mod canvas;
 mod config;
 pub mod gpu_utils;
 mod input_manager_v2;
+mod input_util;
 mod installer;
 mod launcher;
 mod memory_manager;
@@ -627,8 +628,12 @@ impl MissingPythonEnvPromptApp {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for MissingPythonEnvPromptApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35 hands `App::ui` the window-root `Ui`; keep a borrowed `Context` handle for
+        // the calls (viewport commands, helper methods) that still operate on the context.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("Программа не установлена");
                 ui.add_space(8.0);
@@ -992,10 +997,14 @@ impl UpdateCheckApp {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for UpdateCheckApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`. Keep a borrowed `Context` handle
+        // for the context-level calls (poll, viewport commands, repaint scheduling) below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.poll_check_result(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("Проверка обновлений");
                 ui.add_space(8.0);
@@ -1432,10 +1441,14 @@ impl BasicLauncherApp {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl eframe::App for BasicLauncherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // egui 0.35: `App::ui` receives the window-root `Ui`. Keep a borrowed `Context` handle
+        // for the context-level `send_viewport_cmd` call inside the panel body below.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.poll_validation();
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading("Базовый лаунчер");
                 ui.add_space(8.0);

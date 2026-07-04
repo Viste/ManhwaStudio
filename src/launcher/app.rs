@@ -547,7 +547,7 @@ impl LauncherApp {
         ctx.request_repaint();
     }
 
-    fn draw_new_project_window(&mut self, ctx: &egui::Context) {
+    fn draw_new_project_window(&mut self, ui: &mut egui::Ui) {
         if !self.state.new_project_window_open {
             // Reset the flag so the window is maximised again the next time it opens.
             #[cfg(target_os = "windows")]
@@ -557,13 +557,18 @@ impl LauncherApp {
             return;
         }
 
+        // Parent (launcher) context: drives the native child viewport and the
+        // launcher-close command. The embedded web path renders straight into `ui`.
+        #[cfg(not(target_arch = "wasm32"))]
+        let ctx = ui.ctx().clone();
+
         let mut keep_open;
 
         // Web: the browser has no separate OS windows, so render the new-project
         // UI EMBEDDED in the launcher's main viewport (its `show_embedded` path).
         #[cfg(target_arch = "wasm32")]
         {
-            keep_open = self.new_project_window.show(ctx, egui::ViewportClass::Embedded);
+            keep_open = self.new_project_window.show(ui, egui::ViewportClass::EmbeddedWindow);
         }
 
         // Native: the new-project window is its own OS window (immediate viewport).
@@ -587,14 +592,15 @@ impl LauncherApp {
             // so maximisation is deferred to the first rendered frame via ViewportCommand.
             #[cfg(not(target_os = "windows"))]
             let builder = builder.with_maximized(true);
-            ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+            ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
                 #[cfg(target_os = "windows")]
                 if self.new_project_maximize_on_first_frame {
                     self.new_project_maximize_on_first_frame = false;
+                    let ctx = ui.ctx();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
                     ctx.request_repaint();
                 }
-                keep_open = self.new_project_window.show(ctx, class);
+                keep_open = self.new_project_window.show(ui, class);
             });
         }
 
@@ -620,7 +626,7 @@ impl LauncherApp {
         self.state.new_project_window_open = keep_open;
     }
 
-    fn draw_psd_import_window(&mut self, ctx: &egui::Context) {
+    fn draw_psd_import_window(&mut self, ui: &mut egui::Ui) {
         if !self.state.psd_import_window_open {
             // Reset the flag so the window is maximised again the next time it opens.
             #[cfg(target_os = "windows")]
@@ -630,6 +636,8 @@ impl LauncherApp {
             return;
         }
 
+        // Parent (launcher) context: drives the child viewport and launcher-close command.
+        let ctx = ui.ctx().clone();
         let viewport_id = egui::ViewportId::from_hash_of(PSD_IMPORT_VIEWPORT_ID_SALT);
         let mut keep_open = true;
         let builder = crate::launcher::apply_launcher_window_metadata(
@@ -646,14 +654,15 @@ impl LauncherApp {
         );
         #[cfg(not(target_os = "windows"))]
         let builder = builder.with_maximized(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
+        ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
             #[cfg(target_os = "windows")]
             if self.psd_import_maximize_on_first_frame {
                 self.psd_import_maximize_on_first_frame = false;
+                let ctx = ui.ctx();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
                 ctx.request_repaint();
             }
-            keep_open = self.psd_import_window.show(ctx, class);
+            keep_open = self.psd_import_window.show(ui, class);
         });
         if let Some(selection) = self.psd_import_window.take_open_project_selection() {
             if let Ok(mut output) = self.output_outcome.lock() {
@@ -673,11 +682,12 @@ impl LauncherApp {
         self.state.psd_import_window_open = keep_open;
     }
 
-    fn draw_wiki_guide_window(&mut self, ctx: &egui::Context) {
+    fn draw_wiki_guide_window(&mut self, ui: &mut egui::Ui) {
         if !self.wiki_guide_window_open {
             return;
         }
 
+        let ctx = ui.ctx().clone();
         let viewport_id = egui::ViewportId::from_hash_of(WIKI_GUIDE_VIEWPORT_ID_SALT);
         let mut keep_open = true;
         ctx.show_viewport_immediate(
@@ -694,10 +704,11 @@ impl LauncherApp {
                     .with_maximize_button(true)
                     .with_active(true),
             ),
-            |ctx, _class| {
+            |ui, _class| {
+                let ctx = ui.ctx().clone();
                 keep_open = !ctx.input(|input| input.viewport().close_requested());
                 ctx.request_repaint_after(Duration::from_millis(100));
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     self.wiki_guide_tab.draw(ui);
                 });
             },
@@ -765,7 +776,11 @@ fn slot_fade_alpha(loaded_at: Option<Instant>) -> f32 {
 }
 
 impl eframe::App for LauncherApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // eframe 0.35 drives the app from a root `Ui`; derive the `Context`
+        // (cheap Arc clone) for viewport commands, worker polling and child windows.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         #[cfg(target_os = "windows")]
         if self.maximize_root_window_on_first_frame {
             self.maximize_root_window_on_first_frame = false;
@@ -784,7 +799,7 @@ impl eframe::App for LauncherApp {
         if draw_main_panel {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     let rect = viewport_rect;
                     let target_width = calc_column_width(rect.width());
                     if self.background_column_width != target_width {
@@ -799,9 +814,9 @@ impl eframe::App for LauncherApp {
                     self.draw_pages(ctx, ui, rect);
                 });
         }
-        self.draw_new_project_window(ctx);
-        self.draw_psd_import_window(ctx);
-        self.draw_wiki_guide_window(ctx);
+        self.draw_new_project_window(ui);
+        self.draw_psd_import_window(ui);
+        self.draw_wiki_guide_window(ui);
 
         // Native: smooth 60 FPS. Web: throttle the forced repaint to reduce
         // sustained GPU load (a WebGL/driver-stability safeguard for the demo).

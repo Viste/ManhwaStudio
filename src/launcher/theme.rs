@@ -34,7 +34,7 @@ pub const VEIL_TINT: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 112);
 pub const STATUS_SUCCESS: Color32 = Color32::from_rgb(56, 168, 72);
 
 pub fn configure_context(ctx: &Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(18.0, 12.0);
     style.visuals = egui::Visuals::dark();
@@ -78,7 +78,7 @@ pub fn configure_context(ctx: &Context) {
     style.visuals.panel_fill = Color32::TRANSPARENT;
     style.visuals.window_corner_radius = CornerRadius::same(18);
     style.visuals.menu_corner_radius = CornerRadius::same(12);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 pub fn hero_title(text: &str) -> RichText {

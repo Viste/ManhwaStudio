@@ -962,7 +962,7 @@ impl TypingTextOverlayLayer {
     }
 
     pub(super) fn poll_shape_variant_preview(&mut self, ctx: &egui::Context) {
-        if !ctx.is_popup_open() {
+        if !ctx.any_popup_open() {
             self.shape_variant_preview = None;
             return;
         }
@@ -998,7 +998,7 @@ impl TypingTextOverlayLayer {
     }
 
     pub(super) fn draw_shape_variant_preview(&mut self, ctx: &egui::Context) -> Option<TypingShapeVariant> {
-        if !ctx.is_popup_open() {
+        if !ctx.any_popup_open() {
             self.shape_variant_preview = None;
             return None;
         }

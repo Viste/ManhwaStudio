@@ -1034,7 +1034,7 @@ impl TranslationTabState {
     fn image_crop_selection_mode_active(ctx: &egui::Context) -> bool {
         ctx.input(|input| {
             input.modifiers.shift && input.key_down(egui::Key::Q) && !input.any_touches()
-        }) && !ctx.wants_keyboard_input()
+        }) && !ctx.egui_wants_keyboard_input()
     }
 
     fn panel_title(&self, panel: TranslationPanel) -> String {
@@ -1747,7 +1747,7 @@ impl TranslationTabState {
             && q_down
             && !any_modifier
             && !crop_context
-            && !ctx.wants_keyboard_input();
+            && !ctx.egui_wants_keyboard_input();
         if create {
             // One bubble per fresh press: block until Q is released and pressed again.
             self.image_create_q_armed = false;
@@ -2487,26 +2487,21 @@ impl TranslationTabState {
         if !hovered {
             return false;
         }
-        let (mods, smooth_scroll, raw_scroll, primary_down) = ui.ctx().input(|input| {
+        let (mods, smooth_scroll, primary_down) = ui.ctx().input(|input| {
             (
                 input.modifiers,
                 input.smooth_scroll_delta,
-                input.raw_scroll_delta,
                 input.pointer.primary_down(),
             )
         });
         if primary_down {
             return false;
         }
+        // Shift+wheel is delivered on the vertical axis by most backends, but some
+        // convert it to horizontal scroll, so fall back to the X component.
         let mut wheel_delta = smooth_scroll.y;
         if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.y;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
             wheel_delta = smooth_scroll.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
@@ -2519,7 +2514,6 @@ impl TranslationTabState {
         }
         ui.ctx().input_mut(|input| {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
-            input.raw_scroll_delta = egui::Vec2::ZERO;
         });
         if changed {
             ui.ctx().request_repaint();
@@ -2532,7 +2526,7 @@ impl TranslationTabState {
         ui: &mut egui::Ui,
         hovered: bool,
     ) -> bool {
-        if !hovered || ui.ctx().wants_keyboard_input() {
+        if !hovered || ui.ctx().egui_wants_keyboard_input() {
             return false;
         }
         let changed = self
@@ -3451,7 +3445,7 @@ impl TranslationTabState {
         canvas: &CanvasView,
         project: &ProjectData,
     ) {
-        if !self.text_detector_edit_lines_mode || ctx.wants_keyboard_input() {
+        if !self.text_detector_edit_lines_mode || ctx.egui_wants_keyboard_input() {
             return;
         }
         let delete_pressed =

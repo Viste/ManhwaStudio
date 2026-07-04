@@ -797,26 +797,21 @@ impl TypingMaskLayer {
         _image_rect: Rect,
         _zoom: f32,
     ) -> bool {
-        let (mods, smooth_scroll, raw_scroll, primary_down) = ui.ctx().input(|input| {
+        let (mods, smooth_scroll, primary_down) = ui.ctx().input(|input| {
             (
                 input.modifiers,
                 input.smooth_scroll_delta,
-                input.raw_scroll_delta,
                 input.pointer.primary_down(),
             )
         });
         if primary_down {
             return false;
         }
+        // Shift+wheel is delivered on the vertical axis by most backends, but some
+        // convert it to horizontal scroll, so fall back to the X component.
         let mut wheel_delta = smooth_scroll.y;
         if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.y;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
             wheel_delta = smooth_scroll.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.x;
         }
         if wheel_delta.abs() <= f32::EPSILON {
             return false;
@@ -827,7 +822,6 @@ impl TypingMaskLayer {
         }
         ui.ctx().input_mut(|input| {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
-            input.raw_scroll_delta = egui::Vec2::ZERO;
         });
         if changed {
             ui.ctx().request_repaint();
@@ -836,7 +830,7 @@ impl TypingMaskLayer {
     }
 
     fn handle_brush_size_shortcuts(&mut self, ui: &mut egui::Ui) -> bool {
-        if ui.ctx().wants_keyboard_input() {
+        if ui.ctx().egui_wants_keyboard_input() {
             return false;
         }
         let changed = self.mask_brush.handle_size_shortcuts(ui.ctx());

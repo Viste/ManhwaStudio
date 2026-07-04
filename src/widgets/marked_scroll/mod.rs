@@ -110,7 +110,7 @@ impl MarkedScrollArea {
     /// Creates a vertical markable scroll area. `id_salt` namespaces the host
     /// scroll area state and the bar interaction ids.
     #[must_use]
-    pub fn vertical(id_salt: impl std::hash::Hash) -> Self {
+    pub fn vertical(id_salt: impl std::hash::Hash + std::fmt::Debug) -> Self {
         Self {
             id_salt: Id::new(id_salt),
             floating: true,

@@ -90,7 +90,6 @@ pub(super) fn apply_horizontal_wheel_scroll_if_idle(ui: &mut egui::Ui, block_by_
 pub(super) fn consume_wheel_scroll_delta(ui: &egui::Ui) {
     ui.ctx().input_mut(|input| {
         input.smooth_scroll_delta = Vec2::ZERO;
-        input.raw_scroll_delta = Vec2::ZERO;
     });
 }
 

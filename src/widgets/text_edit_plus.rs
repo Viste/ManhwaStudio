@@ -112,7 +112,7 @@ impl<'a> TextEditPlus<'a> {
     }
 
     #[must_use]
-    pub fn id_salt(mut self, salt: impl Hash) -> Self {
+    pub fn id_salt(mut self, salt: impl Hash + std::fmt::Debug) -> Self {
         self.id = Some(Id::new(salt));
         self
     }
@@ -207,7 +207,9 @@ impl<'a> TextEditPlus<'a> {
 
 impl Widget for TextEditPlus<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
-        self.show(ui).response
+        // egui 0.35: `TextEditOutput::response` is an `AtomLayoutResponse`; expose its
+        // inner `Response` as the widget response.
+        self.show(ui).response.response
     }
 }
 
@@ -301,7 +303,8 @@ fn push_layout_section(job: &mut LayoutJob, byte_range: Range<usize>, format: Te
     }
     job.sections.push(egui::text::LayoutSection {
         leading_space: 0.0,
-        byte_range,
+        // epaint 0.35 types layout ranges as `Range<ByteIndex>`; wrap the byte offsets.
+        byte_range: egui::text::ByteIndex(byte_range.start)..egui::text::ByteIndex(byte_range.end),
         format,
     });
 }
@@ -316,7 +319,7 @@ fn paint_backgrounds(ui: &Ui, output: &TextEditOutput, backgrounds: &[TextEditPl
         return;
     }
 
-    let painter = ui.painter_at(output.response.rect);
+    let painter = ui.painter_at(output.response.response.rect);
     for background in backgrounds {
         let start = background.char_range.start.min(char_count);
         let end = background.char_range.end.min(char_count);
@@ -340,17 +343,20 @@ fn paint_background_range(
 ) {
     let mut row_char_start = 0usize;
     for placed_row in &output.galley.rows {
-        let row_char_count = placed_row.char_count_excluding_newline();
+        // epaint 0.35 returns `CharIndex` from row char-count/x-offset APIs; read `.0`
+        // so the row bookkeeping stays in plain character counts.
+        let row_char_count = placed_row.char_count_excluding_newline().0;
         let row_char_end = row_char_start + row_char_count;
-        let row_char_end_with_newline = row_char_start + placed_row.char_count_including_newline();
+        let row_char_end_with_newline =
+            row_char_start + placed_row.char_count_including_newline().0;
         let overlap_start = char_range.start.max(row_char_start);
         let overlap_end = char_range.end.min(row_char_end);
 
         if overlap_start < overlap_end {
             let start_column = overlap_start - row_char_start;
             let end_column = overlap_end - row_char_start;
-            let x_start = placed_row.x_offset(start_column);
-            let x_end = placed_row.x_offset(end_column);
+            let x_start = placed_row.x_offset(egui::text::CharIndex(start_column));
+            let x_end = placed_row.x_offset(egui::text::CharIndex(end_column));
             if x_end > x_start {
                 let row_rect = placed_row.rect().translate(output.galley_pos.to_vec2());
                 let rect = Rect::from_min_max(

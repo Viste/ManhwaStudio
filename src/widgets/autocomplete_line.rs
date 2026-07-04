@@ -37,7 +37,7 @@ pub struct AutocompleteLine {
 }
 
 impl AutocompleteLine {
-    pub fn new(id_source: impl std::hash::Hash) -> Self {
+    pub fn new(id_source: impl std::hash::Hash + std::fmt::Debug) -> Self {
         Self {
             id: Id::new(id_source),
             max_suggestions: DEFAULT_MAX_SUGGESTIONS,
@@ -83,7 +83,9 @@ impl AutocompleteLine {
             text_edit = text_edit.hint_text(self.hint_text.as_str());
         }
         let mut text_output = text_edit.show(ui);
-        let text_response = &text_output.response;
+        // egui 0.35: `TextEditOutput::response` is an `AtomLayoutResponse`; the inner
+        // `Response` is what the rest of this frame reads (rect field access needs it).
+        let text_response = &text_output.response.response;
 
         if *value != self.last_query {
             self.highlighted_idx = None;
@@ -94,7 +96,7 @@ impl AutocompleteLine {
             text_changed && is_deletion_like_change(ui, &value_before_edit, value);
         let caret_at_end_without_selection =
             text_output.state.cursor.char_range().is_some_and(|range| {
-                range.is_empty() && range.primary.index == value.chars().count()
+                range.is_empty() && range.primary.index.0 == value.chars().count()
             });
         if text_changed {
             self.filter_query.clone_from(value);

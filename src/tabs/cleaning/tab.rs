@@ -1254,7 +1254,7 @@ impl CleaningTabState {
     }
 
     fn canvas_pointer_occluded(&self, ctx: &egui::Context, pointer_pos: egui::Pos2) -> bool {
-        ctx.is_popup_open()
+        ctx.any_popup_open()
             || self.pointer_in_any_panel(pointer_pos)
             || self.canvas.pointer_over_scrollbar(pointer_pos)
             || self.active_tool_captures_pointer(pointer_pos)
@@ -1407,7 +1407,7 @@ impl CleaningTabState {
     fn handle_active_tool_hotkeys(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) -> bool {
         let (pointer_pos, modifiers, z_down) =
             ctx.input(|i| (i.pointer.hover_pos(), i.modifiers, i.key_down(egui::Key::Z)));
-        let wants_keyboard_input = ctx.wants_keyboard_input();
+        let wants_keyboard_input = ctx.egui_wants_keyboard_input();
         if wants_keyboard_input {
             return false;
         }
@@ -1430,7 +1430,7 @@ impl CleaningTabState {
     }
 
     fn handle_history_hotkeys(&mut self, ctx: &egui::Context) -> bool {
-        if ctx.wants_keyboard_input() || self.stroke_active {
+        if ctx.egui_wants_keyboard_input() || self.stroke_active {
             return false;
         }
         if self
@@ -1472,11 +1472,7 @@ impl CleaningTabState {
                 i.pointer.hover_pos(),
                 i.modifiers,
                 i.key_down(egui::Key::R),
-                if i.smooth_scroll_delta.length_sq() > f32::EPSILON {
-                    i.smooth_scroll_delta
-                } else {
-                    i.raw_scroll_delta
-                },
+                i.smooth_scroll_delta,
             )
         });
         let Some(pointer_pos) = pointer_pos else {

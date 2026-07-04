@@ -25,7 +25,7 @@ use crate::runtime_log;
 use crate::widgets::EditableComboBox;
 use egui::{
     self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Context, Frame, Grid, Id,
-    Layout, RichText, ScrollArea, Sense, SidePanel, Stroke, TextureHandle, TextureOptions, Ui,
+    Layout, Panel, RichText, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
     ViewportClass,
 };
 use ag_psd::psd::{Layer, PixelData, ReadOptions};
@@ -272,7 +272,11 @@ impl PsdImportWindowState {
         state
     }
 
-    pub fn show(&mut self, ctx: &Context, viewport_class: ViewportClass) -> bool {
+    pub fn show(&mut self, ui: &mut Ui, viewport_class: ViewportClass) -> bool {
+        // The viewport callback hands us a `Ui`; derive its `Context` (cheap Arc clone)
+        // for worker polling, repaint scheduling and the global-style swap below.
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
         self.poll_catalog(ctx);
         self.poll_scan(ctx);
         self.poll_preview(ctx);
@@ -283,16 +287,16 @@ impl PsdImportWindowState {
         }
 
         match viewport_class {
-            ViewportClass::Embedded => self.show_embedded(ctx),
+            ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
             _ => {
                 // A native window is its own viewport but shares the launcher's single egui
                 // Context, so its style is global. Switch to this window's dark style while it
                 // renders and restore the previous (launcher) style afterwards, so it never
                 // leaks back and leaves the launcher's combo boxes / text fields unstyled.
-                let previous_style = ctx.style();
-                ctx.set_style(standard_dark_style());
-                let keep_open = self.show_native(ctx);
-                ctx.set_style(previous_style);
+                let previous_style = ctx.global_style();
+                ctx.set_global_style(standard_dark_style());
+                let keep_open = self.show_native(ui);
+                ctx.set_global_style(previous_style);
                 keep_open
             }
         }
@@ -313,13 +317,13 @@ impl PsdImportWindowState {
         self.catalog.refresh();
     }
 
-    fn show_native(&mut self, ctx: &Context) -> bool {
-        if ctx.input(|input| input.viewport().close_requested()) {
+    fn show_native(&mut self, ui: &mut Ui) -> bool {
+        if ui.ctx().input(|input| input.viewport().close_requested()) {
             return false;
         }
         CentralPanel::default()
             .frame(Frame::new().fill(Color32::from_rgb(24, 24, 27)))
-            .show(ctx, |ui| self.show_contents(ui));
+            .show(ui, |ui| self.show_contents(ui));
         true
     }
 
@@ -362,10 +366,10 @@ impl PsdImportWindowState {
             ui.add_space(4.0);
 
             let left_panel_width = self.left_panel_width(ui.available_width());
-            SidePanel::left("psd_import_left_panel")
+            Panel::left("psd_import_left_panel")
                 .resizable(false)
-                .exact_width(left_panel_width)
-                .show_inside(ui, |ui| {
+                .exact_size(left_panel_width)
+                .show(ui, |ui| {
                     ScrollArea::vertical()
                         .id_salt("psd_import_left_scroll")
                         .auto_shrink([false, false])
@@ -376,7 +380,7 @@ impl PsdImportWindowState {
                         });
                 });
 
-            CentralPanel::default().show_inside(ui, |ui| {
+            CentralPanel::default().show(ui, |ui| {
                 self.show_preview_panel(ui);
             });
         });

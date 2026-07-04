@@ -26,7 +26,7 @@ impl TypingTextOverlayLayer {
         panel_text_input_focused: bool,
         settings: TypingAutoTypingSettings,
     ) {
-        if panel_text_input_focused || ctx.wants_keyboard_input() {
+        if panel_text_input_focused || ctx.egui_wants_keyboard_input() {
             return;
         }
         if self.auto_typing_job.is_some() {

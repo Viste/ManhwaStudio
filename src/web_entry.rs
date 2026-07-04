@@ -92,10 +92,16 @@ enum WebApp {
 }
 
 impl eframe::App for WebApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // egui 0.35 replaced `App::update(&Context, …)` with `App::ui(&mut Ui, …)`. WebApp is a
+        // thin phase switch, so it forwards the same root `Ui` to whichever inner app is active
+        // (their own `App::ui`), while keeping a borrowed `Context` handle for the theme swap on
+        // the launcher→editor transition.
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         match self {
             WebApp::Launcher { app, outcome } => {
-                app.update(ctx, frame);
+                app.ui(ui, frame);
                 // Poll the launcher's outcome; on "open project" swap to the editor.
                 let selection = match outcome.lock() {
                     Ok(mut guard) => match guard.take() {
@@ -115,7 +121,7 @@ impl eframe::App for WebApp {
                     }
                 }
             }
-            WebApp::Editor(app) => app.update(ctx, frame),
+            WebApp::Editor(app) => app.ui(ui, frame),
         }
     }
 }

@@ -4,7 +4,7 @@ version = "3.5.0"
 edition = "2024"
 
 [workspace]
-members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread"]
+members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-thread", "crates/puffin_egui"]
 
 [features]
 active-logs = []
@@ -40,8 +40,11 @@ web-time = "1"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
-eframe = "0.33"
-egui = "0.33"
+# egui 0.35 changed the eframe default renderer to wgpu; ManhwaStudio uses the
+# glow renderer (App::on_exit takes an Option<&glow::Context>), so glow is pinned
+# explicitly with default features (incl. wgpu) turned off.
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "wayland", "x11", "web_screen_reader"] }
+egui = "0.35"
 cosmic-text = "0.14"
 swash = "0.2"
 zeno = "0.3"
@@ -61,7 +64,9 @@ ag-psd = "0.1.0"
 zspell = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 puffin = { version = "0.20.0", optional = true }
-puffin_egui = { version = "0.30", optional = true }
+# Vendored & ported to egui 0.35 (crates/puffin_egui); upstream has no 0.34/0.35
+# release. See crates/puffin_egui/Cargo.toml.
+puffin_egui = { path = "crates/puffin_egui", optional = true }
 
 # Native-only dependencies: native sockets / blocking HTTP (ureq, hf-hub,
 # translators, genai+tokio), dynamic library loading (libloading), OS credential

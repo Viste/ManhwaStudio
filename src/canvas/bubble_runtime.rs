@@ -1137,7 +1137,7 @@ impl CanvasView {
     }
 
     pub(super) fn capture_clipboard_events(&mut self, project: &ProjectData, ctx: &egui::Context) {
-        let keyboard_input_active = ctx.wants_keyboard_input();
+        let keyboard_input_active = ctx.egui_wants_keyboard_input();
         // Inspect events by reference inside the input closure and copy out only the few
         // clipboard variants we act on (Copy/Cut and the small paste payload), instead of
         // cloning the whole per-frame events vector (key/pointer/text events included).

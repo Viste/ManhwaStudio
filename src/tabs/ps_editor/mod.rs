@@ -1669,14 +1669,14 @@ impl PsEditorTabState {
         self.draw_toolbar(ui);
         self.draw_layers_panel(ui, project);
         self.draw_effects_editor(ctx);
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.draw_canvas(ctx, ui, project);
         });
     }
 
     /// Top page-switch bar plus zoom controls.
     fn draw_top_bar(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui, project: &ProjectData) {
-        egui::TopBottomPanel::top("ps_editor_top").show_inside(ui, |ui| {
+        egui::Panel::top("ps_editor_top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Страница:");
                 let page_indices: Vec<usize> = project.pages.iter().map(|p| p.idx).collect();
@@ -1736,10 +1736,10 @@ impl PsEditorTabState {
 
     /// Left vertical tool selector + active tool options.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        egui::SidePanel::left("ps_editor_tools")
+        egui::Panel::left("ps_editor_tools")
             .resizable(false)
-            .default_width(220.0)
-            .show_inside(ui, |ui| {
+            .default_size(220.0)
+            .show(ui, |ui| {
                 ui.heading("Инструменты");
                 for index in 0..self.tools.len() {
                     let selected = index == self.active_tool_idx;
@@ -1807,10 +1807,10 @@ impl PsEditorTabState {
     /// group indent), collapsible/movable groups that may mix rasters and texts, Shift/Ctrl
     /// multi-select, a right-click menu for grouping, and a controls strip for the active layer.
     fn draw_layers_panel(&mut self, ui: &mut egui::Ui, project: &ProjectData) {
-        let actions = egui::SidePanel::right("ps_editor_layers")
+        let actions = egui::Panel::right("ps_editor_layers")
             .resizable(true)
-            .default_width(260.0)
-            .show_inside(ui, |ui| self.layers_panel_body(ui))
+            .default_size(260.0)
+            .show(ui, |ui| self.layers_panel_body(ui))
             .inner;
         self.apply_panel_actions(actions, project);
     }
@@ -3463,7 +3463,7 @@ impl PsEditorTabState {
             middle_down: i.pointer.middle_down(),
             space_down: i.key_down(egui::Key::Space),
             pointer_delta: i.pointer.delta(),
-            scroll_y: i.raw_scroll_delta.y,
+            scroll_y: i.smooth_scroll_delta.y,
             modifiers: i.modifiers,
         });
         let hovered = response.hovered();

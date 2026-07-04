@@ -158,16 +158,16 @@ impl TypingTextOverlayLayer {
         let mut select_raster: Option<usize> = None;
 
         // Representative glyph width + row height from the current font/spacing (not magic numbers).
-        // egui 0.33's `Fonts*::glyph_width`/`row_height` need a &mut view (only `Painter`/`Ui` text
+        // egui's `Fonts*::glyph_width`/`row_height` need a &mut view (only `Painter`/`Ui` text
         // measuring gives it), so measure a 10-glyph run via a galley and divide.
-        let font_id = egui::TextStyle::Body.resolve(&ui.ctx().style());
+        let font_id = egui::TextStyle::Body.resolve(&ui.ctx().global_style());
         let probe = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap("оооооооооо".to_string(), font_id.clone(), Color32::WHITE)
         });
         let char_px = (probe.rect.width() / 10.0).max(1.0);
         let line_height = probe.rect.height().max(1.0);
         // A row is a line plus the vertical item spacing between rows.
-        let row_height = (line_height + ui.ctx().style().spacing.item_spacing.y).max(1.0);
+        let row_height = (line_height + ui.ctx().global_style().spacing.item_spacing.y).max(1.0);
         let list_height = row_height * LAYERS_PANEL_DEFAULT_ROWS as f32;
 
         // MIN width = overhead + exactly `LAYERS_PANEL_MIN_PREVIEW_CHARS` chars of preview, so at the

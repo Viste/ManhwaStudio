@@ -15,8 +15,9 @@ FILE HEADER (widgets/wheel_combo_box.rs)
     не реагировали на прокрутку выпадающего списка;
   - popup публикует viewport списка, чтобы нижние виджеты не подсвечивались
     и не считали себя наведёнными под раскрытым списком;
-  - raw и smooth wheel delta очищаются внутри виджета, поэтому ScrollArea
-    выше по дереву не получает прокрутку.
+  - a discrete wheel notch is detected from the raw `Event::MouseWheel` events
+    (egui 0.35 has no `raw_scroll_delta`), giving one index step per notch, and the
+    smoothed scroll delta is zeroed so a parent `ScrollArea` receives no scroll.
 */
 #![allow(dead_code)]
 
@@ -49,7 +50,10 @@ pub struct WheelComboBoxUiResponse<R> {
 }
 
 impl WheelComboBox {
-    pub fn new(id_salt: impl std::hash::Hash, label: impl Into<WidgetText>) -> Self {
+    pub fn new(
+        id_salt: impl std::hash::Hash + std::fmt::Debug,
+        label: impl Into<WidgetText>,
+    ) -> Self {
         Self {
             id_salt: Id::new(id_salt),
             label: Some(label.into()),
@@ -78,7 +82,7 @@ impl WheelComboBox {
         }
     }
 
-    pub fn from_id_salt(id_salt: impl std::hash::Hash) -> Self {
+    pub fn from_id_salt(id_salt: impl std::hash::Hash + std::fmt::Debug) -> Self {
         Self {
             id_salt: Id::new(id_salt),
             label: None,
@@ -279,9 +283,9 @@ fn wheel_steps_if_hovered(ctx: &Context, response: &Response) -> Option<i32> {
         return None;
     }
 
-    let (raw_scroll_delta, smooth_scroll_delta) =
-        ctx.input(|input| (input.raw_scroll_delta, input.smooth_scroll_delta));
-    let raw_wheel_delta = axis_wheel_delta(raw_scroll_delta);
+    let (raw_wheel_events, smooth_scroll_delta) =
+        ctx.input(|input| (raw_wheel_events_delta(input), input.smooth_scroll_delta));
+    let raw_wheel_delta = axis_wheel_delta(raw_wheel_events);
     let smooth_wheel_delta = axis_wheel_delta(smooth_scroll_delta);
     if raw_wheel_delta.abs() <= f32::EPSILON && smooth_wheel_delta.abs() <= f32::EPSILON {
         return None;
@@ -299,6 +303,24 @@ fn wheel_steps_if_hovered(ctx: &Context, response: &Response) -> Option<i32> {
     }
 }
 
+/// Sums the raw (unsmoothed) mouse-wheel delta reported this frame.
+///
+/// egui 0.35 removed `InputState::raw_scroll_delta`, so the per-frame unsmoothed
+/// wheel movement is recovered by summing `Event::MouseWheel` deltas. Unlike
+/// `smooth_scroll_delta`, which ramps over several frames, this is nonzero only on
+/// the frame a physical wheel notch arrives, so it yields exactly one step per notch.
+/// Only the sign is used downstream, so the event `unit` is irrelevant.
+fn raw_wheel_events_delta(input: &egui::InputState) -> egui::Vec2 {
+    input
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel { delta, .. } => Some(*delta),
+            _ => None,
+        })
+        .fold(egui::Vec2::ZERO, |acc, delta| acc + delta)
+}
+
 fn axis_wheel_delta(delta: egui::Vec2) -> f32 {
     if delta.y.abs() > f32::EPSILON {
         delta.y
@@ -314,6 +336,5 @@ fn wheel_direction(wheel_delta: f32) -> i32 {
 fn consume_wheel_scroll_delta(ctx: &Context) {
     ctx.input_mut(|input| {
         input.smooth_scroll_delta = egui::Vec2::ZERO;
-        input.raw_scroll_delta = egui::Vec2::ZERO;
     });
 }

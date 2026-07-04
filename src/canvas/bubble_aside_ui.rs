@@ -1905,7 +1905,7 @@ fn draw_aside_slots(
             && selected_now
             && !canvas.scene.zoom_drag_active
             && canvas.bubble_runtime.move_active_bid.is_none()
-            && !ui.ctx().wants_keyboard_input()
+            && !ui.ctx().egui_wants_keyboard_input()
             && canvas
                 .bubble_runtime
                 .active_rect_handle

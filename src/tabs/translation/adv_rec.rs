@@ -775,7 +775,6 @@ fn handle_adv_rec_image_input(
         mods,
         z_down,
         smooth_scroll,
-        raw_scroll,
     ) = ui.ctx().input(|i| {
         (
             i.pointer.primary_down(),
@@ -785,7 +784,6 @@ fn handle_adv_rec_image_input(
             i.modifiers,
             i.key_down(egui::Key::Z),
             i.smooth_scroll_delta,
-            i.raw_scroll_delta,
         )
     });
     let zoom_modifier_down = mods.ctrl || mods.command || z_down;
@@ -878,20 +876,15 @@ fn handle_adv_rec_image_input(
 
     let image_hovered = hover_pos.is_some_and(|p| image_rect.contains(p));
     if image_hovered {
+        // Shift+wheel adjusts the brush; some backends deliver it as horizontal
+        // scroll, so fall back to the X component.
         let mut wheel_delta = smooth_scroll.y;
         if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.y;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
             wheel_delta = smooth_scroll.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_scroll.x;
         }
         if mods.shift && !zoom_modifier_down && session.brush.handle_wheel(wheel_delta, mods) {
             ui.ctx().input_mut(|input| {
                 input.smooth_scroll_delta = egui::Vec2::ZERO;
-                input.raw_scroll_delta = egui::Vec2::ZERO;
             });
             ui.ctx().request_repaint();
         }
@@ -963,7 +956,9 @@ fn handle_adv_rec_zoom_input(
             i.pointer.interact_pos(),
             i.key_down(egui::Key::Z),
             i.pointer.primary_down(),
-            i.smooth_scroll_delta.y + i.raw_scroll_delta.y,
+            // Raw wheel: stays non-zero under Ctrl/Cmd (egui zeroes
+            // `smooth_scroll_delta` there, diverting the wheel into zoom).
+            crate::input_util::raw_wheel_delta(i).y,
         )
     });
     let zoom_modifier_down = mods.ctrl || mods.command || z_down;
@@ -982,7 +977,6 @@ fn handle_adv_rec_zoom_input(
         changed |= session.scale_zoom(factor);
         ctx.input_mut(|input| {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
-            input.raw_scroll_delta = egui::Vec2::ZERO;
         });
     }
 

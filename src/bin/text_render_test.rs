@@ -496,8 +496,9 @@ impl TextRenderTestApp {
 }
 
 impl eframe::App for TextRenderTestApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_render_results(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_render_results(&ctx);
 
         if self.needs_initial_render {
             self.needs_initial_render = false;
@@ -510,9 +511,9 @@ impl eframe::App for TextRenderTestApp {
             self.selected_face_idx = 0;
         }
 
-        egui::SidePanel::left("controls_panel")
-            .min_width(340.0)
-            .show(ctx, |ui| {
+        egui::Panel::left("controls_panel")
+            .min_size(340.0)
+            .show(ui, |ui| {
                 ui.heading("Text Render Test");
                 ui.label(format!("Fonts dir: {}", self.fonts_dir.display()));
                 ui.separator();
@@ -1241,7 +1242,7 @@ impl eframe::App for TextRenderTestApp {
                 ui.label(&self.status_line);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {

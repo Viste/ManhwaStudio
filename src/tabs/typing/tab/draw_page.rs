@@ -280,7 +280,7 @@ impl TypingTextOverlayLayer {
             let mut clicked_overlay_idx: Option<usize> = None;
             let mut pending_delete_overlay_idx: Option<usize> = None;
             let mut pending_enter_layout_editor_idx: Option<usize> = None;
-            let popup_open_before = ui.ctx().is_popup_open();
+            let popup_open_before = ui.ctx().any_popup_open();
             // Sticky-фокус: если клик пришёлся внутрь рамки уже выделенного оверлея,
             // фокус остаётся на нём, даже если сверху лежит перекрывающий оверлей или
             // растровый слой. Считаем это один раз по позиции клика и по grab-мешу
@@ -1019,11 +1019,11 @@ impl TypingTextOverlayLayer {
                 self.begin_layout_editor_for_overlay(editor_idx, image_rect, zoom);
                 ctx.request_repaint();
             }
-            let popup_open_after = ui.ctx().is_popup_open();
+            let popup_open_after = ui.ctx().any_popup_open();
             let popup_open = popup_open_before || popup_open_after;
             let delete_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
             if delete_pressed
-                && !ui.ctx().wants_keyboard_input()
+                && !ui.ctx().egui_wants_keyboard_input()
                 && let Some(selected_idx) = self.selected_overlay_idx
                 && self
                     .overlays
@@ -1041,7 +1041,7 @@ impl TypingTextOverlayLayer {
                         .is_some_and(|pos| image_rect.contains(pos))
                     && clicked_overlay_idx.is_none()
             }) && !popup_open
-                && !ui.ctx().is_pointer_over_area()
+                && !crate::input_util::pointer_over_floating_area(ui.ctx())
                 && !eyedropper_blocks_focus_clear;
             if clicked_on_image_without_overlay {
                 if self

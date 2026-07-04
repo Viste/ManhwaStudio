@@ -454,7 +454,7 @@ impl CleaningTool for ZamazkaTool {
         canvas: &CanvasView,
         pointer_scene_pos: Option<egui::Pos2>,
     ) {
-        if ui.ctx().is_popup_open() {
+        if ui.ctx().any_popup_open() {
             ui.ctx()
                 .output_mut(|out| out.cursor_icon = egui::CursorIcon::Default);
             return;

@@ -268,7 +268,7 @@ impl InputManagerV2 {
     }
 
     pub fn collect_triggered(&mut self, ctx: &egui::Context, active_tab: AppTab) -> Vec<String> {
-        let wants_keyboard_input = ctx.wants_keyboard_input();
+        let wants_keyboard_input = ctx.egui_wants_keyboard_input();
         let mut triggered = Vec::new();
 
         for command in &mut self.commands {

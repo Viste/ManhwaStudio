@@ -410,7 +410,7 @@ enum RibbonImageControlAction {
     MergeWithNext,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum CropHandle {
     Move,
     Left,
@@ -770,7 +770,11 @@ impl NewProjectWindowState {
         state
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, viewport_class: ViewportClass) -> bool {
+    pub fn show(&mut self, ui: &mut egui::Ui, viewport_class: ViewportClass) -> bool {
+        // The viewport callback hands us a `Ui`; derive its `Context` (cheap Arc clone)
+        // so the worker polling, sub-windows and global-style swap below stay unchanged.
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
         self.poll_clipboard_paste();
         self.poll_screen_capture();
         self.maybe_start_pending_screen_capture();
@@ -789,14 +793,14 @@ impl NewProjectWindowState {
         // rendering and restore the previous (launcher) style afterwards, so it never leaks
         // back and leaves the launcher's combo boxes / text fields unstyled. The embedded path
         // scopes its style via `ui.set_style` instead and needs no global change.
-        let restore_style = (!matches!(viewport_class, ViewportClass::Embedded)).then(|| {
-            let previous = ctx.style();
-            ctx.set_style(standard_dark_style());
+        let restore_style = (!matches!(viewport_class, ViewportClass::EmbeddedWindow)).then(|| {
+            let previous = ctx.global_style();
+            ctx.set_global_style(standard_dark_style());
             previous
         });
         let keep_open = match viewport_class {
-            ViewportClass::Embedded => self.show_embedded(ctx),
-            _ => self.show_native(ctx),
+            ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
+            _ => self.show_native(ui),
         };
         self.show_crop_editor_window(ctx);
         self.show_advanced_downloader_version_warning(ctx);
@@ -824,7 +828,7 @@ impl NewProjectWindowState {
             self.handle_window_closed();
         }
         if let Some(previous_style) = restore_style {
-            ctx.set_style(previous_style);
+            ctx.set_global_style(previous_style);
         }
         keep_open
     }
@@ -848,8 +852,8 @@ impl NewProjectWindowState {
         self.project_catalog.refresh();
     }
 
-    fn show_native(&mut self, ctx: &egui::Context) -> bool {
-        if ctx.input(|input| input.viewport().close_requested()) {
+    fn show_native(&mut self, ui: &mut egui::Ui) -> bool {
+        if ui.ctx().input(|input| input.viewport().close_requested()) {
             return false;
         }
 
@@ -859,7 +863,7 @@ impl NewProjectWindowState {
                     .fill(egui::Color32::from_rgb(24, 24, 27))
                     .inner_margin(egui::Margin::same(18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 self.show_contents(ui, false);
             });
         true
@@ -1949,7 +1953,8 @@ impl NewProjectWindowState {
                 .with_active(true),
         );
 
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, _class| {
+        ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
+            let ctx = ui.ctx().clone();
             keep_open = !ctx.input(|input| input.viewport().close_requested());
             if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
                 keep_open = false;
@@ -1961,7 +1966,7 @@ impl NewProjectWindowState {
 
             CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     render_screen_capture_overlay(ui, overlay);
                     if show_screen_capture_overlay_controls(ui, overlay.selection) {
                         capture_requested = true;
@@ -6747,8 +6752,9 @@ impl NewProjectWindowState {
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
             .with_resizable(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ctx, class| {
-            let keep_open = self.batch_processing.show(ctx, class);
+        ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
+            let ctx = ui.ctx().clone();
+            let keep_open = self.batch_processing.show(ui, class);
             if !keep_open {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.batch_processing_window_open = false;

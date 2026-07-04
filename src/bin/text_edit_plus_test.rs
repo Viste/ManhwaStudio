@@ -99,11 +99,11 @@ impl TextEditPlusTestApp {
 }
 
 impl eframe::App for TextEditPlusTestApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::SidePanel::left("controls_panel")
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::left("controls_panel")
             .resizable(false)
-            .default_width(280.0)
-            .show(ctx, |ui| {
+            .default_size(280.0)
+            .show(ui, |ui| {
                 ui.heading("TextEditPlus");
                 ui.label(format!("Символов: {}", self.text.chars().count()));
                 ui.add_space(8.0);
@@ -117,7 +117,7 @@ impl eframe::App for TextEditPlusTestApp {
                 draw_range_control(ui, "Розовый фон выше", &mut self.pink_background);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Редактор");
             ui.label(
                 RichText::new("Фоны рисуются по порядку: розовый элемент находится выше голубого.")

@@ -272,7 +272,7 @@ impl TypingTextOverlayLayer {
                             .desired_width(f32::INFINITY)
                             .desired_rows(1)
                             .lock_focus(true)
-                            .frame(false);
+                            .frame(egui::Frame::NONE);
                         let output = edit.show(ui);
                         let viewport_focused =
                             ctx.input(|input| input.viewport().focused.unwrap_or(true));

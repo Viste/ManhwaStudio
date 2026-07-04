@@ -440,7 +440,7 @@ impl CanvasView {
                 && self.overlay_runtime.overlays_visible
                 && !self.overlay_runtime.overlay_render_suppressed,
             space_pan_drag_enabled: ctx.input(|i| i.key_down(egui::Key::Space))
-                && !ctx.wants_keyboard_input(),
+                && !ctx.egui_wants_keyboard_input(),
         }
     }
 
@@ -473,9 +473,14 @@ impl CanvasView {
             .auto_shrink([false, false])
             .scroll_source(egui::scroll_area::ScrollSource {
                 scroll_bar: true,
-                drag: frame.space_pan_drag_enabled
+                drag: if frame.space_pan_drag_enabled
                     && !self.scene.drag_scroll_blocked
-                    && !frame.zoom_drag_active,
+                    && !frame.zoom_drag_active
+                {
+                    egui::scroll_area::DragScroll::Always
+                } else {
+                    egui::scroll_area::DragScroll::Never
+                },
                 mouse_wheel: !frame.suppress_wheel_scroll && !self.scene.wheel_scroll_blocked,
             });
         if let Some(offset) = requested_offset {

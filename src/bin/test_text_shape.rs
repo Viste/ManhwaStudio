@@ -85,7 +85,7 @@ impl ShapePreviewApp {
 }
 
 impl eframe::App for ShapePreviewApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let preview_text = reshape_text_for_shape(
             self.source_text.as_str(),
             self.max_width_chars,
@@ -95,7 +95,7 @@ impl eframe::App for ShapePreviewApp {
         );
         let centered_preview = center_preview_lines(preview_text.as_str(), self.max_width_chars);
 
-        egui::TopBottomPanel::bottom("controls_panel").show(ctx, |ui| {
+        egui::Panel::bottom("controls_panel").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_label("Форма")
@@ -130,7 +130,7 @@ impl eframe::App for ShapePreviewApp {
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.columns(2, |columns| {
                 columns[0].heading("Исходный текст");
                 columns[0].add(
