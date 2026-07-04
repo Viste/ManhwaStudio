@@ -296,7 +296,9 @@ impl AdvancedDownloadController {
             daemon: Arc::new(Mutex::new(None)),
             pending: None,
             available_browsers: detect_available_browsers(),
-            backend: AdvancedBrowserBackend::Selenium,
+            // Cloak is the default backend: it powers the universal deep-capture
+            // ("глубокий перехват") workflow, which is the recommended path.
+            backend: AdvancedBrowserBackend::Cloak,
         }
     }
 
@@ -2640,7 +2642,25 @@ fn looks_like_domain(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{advanced_downloader_version_warning_message, auto_url_group_signature};
+    use super::{
+        AdvancedBrowserBackend, AdvancedDownloadController,
+        advanced_downloader_version_warning_message, auto_url_group_signature,
+    };
+
+    #[test]
+    fn new_controller_defaults_to_cloak_backend() {
+        // Cloak is the default so the recommended deep-capture path works out of
+        // the box, including the simple-mode auto-capture section.
+        let controller = AdvancedDownloadController::new();
+        assert_eq!(controller.backend(), AdvancedBrowserBackend::Cloak);
+    }
+
+    #[test]
+    fn set_backend_is_noop_for_same_backend() {
+        let mut controller = AdvancedDownloadController::new();
+        controller.set_backend(AdvancedBrowserBackend::Cloak);
+        assert_eq!(controller.backend(), AdvancedBrowserBackend::Cloak);
+    }
 
     #[test]
     fn formats_advanced_downloader_version_warning() {

@@ -76,7 +76,11 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   `ai_backend_supervisor`; `new_project` only requests a start (start-gate) if it is not running.
 - Cloak deep capture is a review-mode acquisition path: Rust only starts/stops/status-polls the
   session and must keep decoded results behind the existing auto-review window before adding them to
-  the ribbon.
+  the ribbon. Cloak + deep capture is the default backend/mode. The simple-mode "Автоматический
+  перехват картинок" section is a thin entry point into this same path: it shares the advanced
+  download state (`advanced_page_url`, `advanced_intercept_*`) and reuses the advanced wrappers, but
+  first calls `prepare_simple_deep_capture` to force Cloak + `DeepCapture` since it has no
+  backend/mode selectors.
 - The advanced downloader version is read via the `version` command (`downloader_version`); Rust
   compares it with `CARGO_PKG_VERSION` and shows a session-only warning on mismatch.
 - Waifu2x must keep the application usable when the shared library is absent; the worker either

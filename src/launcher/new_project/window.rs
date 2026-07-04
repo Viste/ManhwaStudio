@@ -570,6 +570,10 @@ pub struct NewProjectWindowState {
     save_title_combo: EditableComboBox,
     save_chapter: String,
     save_mode: SaveMode,
+    /// Last folder chosen for an independent save during this session. The next
+    /// independent-save dialog opens at this folder's parent so a "chapter"
+    /// pick (`.../16`) reopens at the "title" level (`.../`).
+    last_independent_save_dir: Option<PathBuf>,
     alt_title: usize,
     alt_chapter: usize,
     alt_name: String,
@@ -634,7 +638,9 @@ impl NewProjectWindowState {
             selected_site,
             browser_names,
             site_presets,
-            advanced_mode: AdvancedDownloadMode::PatternLinkSearch,
+            // Deep capture is the default advanced mode; it pairs with the Cloak
+            // backend default and drives the simple-mode auto-capture section.
+            advanced_mode: AdvancedDownloadMode::DeepCapture,
             advanced_link_source_mode: AdvancedLinkSourceMode::Pattern,
             advanced_link_collect_active: false,
             advanced_link_collect_found_links: 0,
@@ -720,6 +726,7 @@ impl NewProjectWindowState {
                 .with_hint_text("Выберите тайтл или введите свой"),
             save_chapter: String::new(),
             save_mode: SaveMode::ProjectBase,
+            last_independent_save_dir: None,
             alt_title: 0,
             alt_chapter: 0,
             alt_name: String::new(),
@@ -1186,6 +1193,82 @@ impl NewProjectWindowState {
                         {
                             self.start_test_chapter_download();
                         }
+                    },
+                );
+
+                ui.add_space(SECTION_SPACING);
+                sub_group(
+                    ui,
+                    "Автоматический перехват картинок",
+                    |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Наиболее универсальный метод, но потом нужно будет вручную удалить лишние картинки",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.add(
+                            TextEdit::singleline(&mut self.advanced_page_url)
+                                .desired_width(fill_width(ui))
+                                .hint_text("Вставьте ссылку на главу"),
+                        );
+                        ui.add_space(8.0);
+
+                        // Deep capture cannot run while another advanced command
+                        // is in flight; the URL is only needed to open the page.
+                        let capture_busy = self.advanced_download.is_loading();
+                        let url_ready = !self.advanced_page_url.trim().is_empty();
+
+                        if button_sized(
+                            ui,
+                            "Открыть в браузере",
+                            egui::vec2(220.0, 34.0),
+                            !capture_busy && !self.advanced_intercept_active && url_ready,
+                        )
+                        .clicked()
+                        {
+                            self.prepare_simple_deep_capture();
+                            self.start_advanced_open();
+                        }
+                        ui.add_space(8.0);
+
+                        if self.advanced_intercept_active {
+                            let counts = self.advanced_intercept_counts;
+                            ui.label(
+                                RichText::new(format!(
+                                    "Перехвачено {} холстов, найдено {} обычных картинок",
+                                    counts.canvases, counts.images
+                                ))
+                                .color(egui::Color32::from_rgb(76, 175, 80))
+                                .strong(),
+                            );
+                            ui.add_space(8.0);
+                        }
+
+                        if button_sized(
+                            ui,
+                            "Начать перехват",
+                            egui::vec2(220.0, 34.0),
+                            !capture_busy && !self.advanced_intercept_active,
+                        )
+                        .clicked()
+                        {
+                            self.prepare_simple_deep_capture();
+                            self.start_advanced_deep_intercept();
+                        }
+                        if button_sized(
+                            ui,
+                            "Завершить перехват",
+                            egui::vec2(220.0, 34.0),
+                            !capture_busy && self.advanced_intercept_active,
+                        )
+                        .clicked()
+                        {
+                            self.finish_advanced_deep_intercept();
+                        }
+                        self.show_operation_progress(ui, "advanced_download");
                     },
                 );
 
@@ -4647,9 +4730,21 @@ impl NewProjectWindowState {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn start_save_to_folder(&mut self) {
-        let Some(folder) = FileDialog::new().pick_folder() else {
+        let mut dialog = FileDialog::new();
+        // Reopen one level above the previous session pick: after saving a
+        // chapter into `.../16`, the next dialog starts at the title folder
+        // `.../` so sibling chapters are one click away.
+        if let Some(parent) = self
+            .last_independent_save_dir
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(folder) = dialog.pick_folder() else {
             return;
         };
+        self.last_independent_save_dir = Some(folder.clone());
         let should_continue = match confirm_overwrite_nonempty(&folder) {
             Ok(value) => value,
             Err(err) => {
@@ -6485,6 +6580,18 @@ impl NewProjectWindowState {
         self.import_status =
             "Останавливаем перехват Canvas и сохраняем найденные холсты...".to_string();
         self.advanced_download.begin_stop_canvas_intercept(browser);
+    }
+
+    /// Forces the deep-capture preconditions for the simple-mode
+    /// "Автоматический перехват картинок" section, whose buttons have no
+    /// backend/mode selectors: Cloak backend on both the UI state and the
+    /// controller, and `DeepCapture` mode so the count poller queries the
+    /// deep-intercept counters. `set_backend` is a no-op when already Cloak.
+    fn prepare_simple_deep_capture(&mut self) {
+        self.selected_advanced_backend = AdvancedBrowserBackend::Cloak;
+        self.advanced_mode = AdvancedDownloadMode::DeepCapture;
+        self.advanced_download
+            .set_backend(AdvancedBrowserBackend::Cloak);
     }
 
     fn start_advanced_deep_intercept(&mut self) {
