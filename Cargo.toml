@@ -19,6 +19,11 @@ web = []
 # Enable with `cargo run --features profiling` to record per-frame puffin scopes
 # and show the puffin_egui profiler window inside the editor.
 profiling = ["dep:puffin", "dep:puffin_egui"]
+# Dev/debug: enable egui 0.35's inspection protocol so an external inspector
+# (e.g. the `egui_mcp` MCP server) can attach over TCP and read the widget tree,
+# inject input, and capture screenshots. Active only when the `EGUI_INSPECTION`
+# env var is set at runtime; off by default so production builds are unaffected.
+inspection = ["eframe/inspection"]
 
 [[bin]]
 name = "render_gallery"
