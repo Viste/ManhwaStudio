@@ -393,6 +393,48 @@
     }
 
     #[test]
+    fn deform_mesh_clamps_to_page_size_not_text_bitmap_size() {
+        // Regression: a deformed text overlay's `DeformRec.points_px` are ABSOLUTE PAGE pixels. When
+        // `sync_from_doc` re-materializes the runtime mesh after a drag-release round-trip through the
+        // doc, it must clamp against the PAGE size, not the small text-bitmap size. Passing the bitmap
+        // size collapses the full-page control points into a degenerate box near the origin, so the
+        // deformed text vanishes on the first idle frame after release. This asserts the invariant the
+        // fix restores: page-size construction preserves lower/right-page points; bitmap-size
+        // construction collapses them.
+        let cols = TEXT_OVERLAY_DEFORM_SURFACE_COLS;
+        let rows = TEXT_OVERLAY_DEFORM_SURFACE_ROWS;
+        let page_size = [800usize, 1200];
+        // A grid placed in the lower-right region of the page — outside the small bitmap's clamp range.
+        let (x0, x1) = (350.0_f32, 650.0);
+        let (y0, y1) = (900.0_f32, 1100.0);
+        let mut points_px = Vec::with_capacity(cols * rows);
+        for row in 0..rows {
+            let tv = row as f32 / (rows - 1) as f32;
+            for col in 0..cols {
+                let tu = col as f32 / (cols - 1) as f32;
+                points_px.push([x0 + (x1 - x0) * tu, y0 + (y1 - y0) * tv]);
+            }
+        }
+        let br = [points_px[cols * rows - 1][0], points_px[cols * rows - 1][1]];
+
+        // Page-size construction: control points survive intact (all within [-0.9·side, 1.9·side]).
+        let good = TypingOverlayDeformMesh::new(cols, rows, points_px.clone(), page_size)
+            .expect("valid grid builds a mesh");
+        let br_good = good.point(cols - 1, rows - 1);
+        assert!((br_good[0] - br[0]).abs() < 1e-3, "page-size keeps BR x");
+        assert!((br_good[1] - br[1]).abs() < 1e-3, "page-size keeps BR y");
+
+        // Bitmap-size construction (the bug): the small size clamps the lower-right point away from its
+        // true page position, proving the size argument must be the page size.
+        let bitmap_size = [300usize, 120];
+        let bad = TypingOverlayDeformMesh::new(cols, rows, points_px, bitmap_size)
+            .expect("valid grid builds a mesh");
+        let br_bad = bad.point(cols - 1, rows - 1);
+        // 1.9 * 120 = 228 is the max clamped y; the true y (1100) is far above it.
+        assert!(br_bad[1] < br[1] - 1.0, "bitmap-size collapses BR y (the bug the fix avoids)");
+    }
+
+    #[test]
     fn effects_json_array_emptiness_is_detected() {
         assert!(effects_json_array_is_empty(""));
         assert!(effects_json_array_is_empty("   "));

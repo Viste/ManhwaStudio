@@ -60,6 +60,7 @@ const TORCHVISION_VERSION: &str = "0.24.1";
 const PADDLE_CU126_INDEX_URL: &str = "https://www.paddlepaddle.org.cn/packages/stable/cu126/";
 const ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL: bool = false;
 const BASE_DEPENDENCIES: &[&str] = &[
+    "cloakbrowser",
     "deep-translator",
     "jaconv",
     "numpy",
@@ -67,6 +68,7 @@ const BASE_DEPENDENCIES: &[&str] = &[
     "onnxruntime-directml; platform_system == \"Windows\"",
     "opencv-python",
     "Pillow",
+    "playwright",
     "pyclipper",
     "requests",
     "selenium",
@@ -74,6 +76,7 @@ const BASE_DEPENDENCIES: &[&str] = &[
 ];
 const TORCH_DEPENDENCIES: &[&str] = &[
     "certifi",
+    "diffusers",
     "easydict",
     "easyocr",
     "einops",
@@ -84,6 +87,7 @@ const TORCH_DEPENDENCIES: &[&str] = &[
     "pandas",
     "pytorch-lightning",
     "PyYAML",
+    "reline",
     "shapely",
     "surya-ocr",
     "tqdm",

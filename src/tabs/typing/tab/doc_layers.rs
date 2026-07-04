@@ -498,6 +498,12 @@ impl TypingTextOverlayLayer {
         // typing tab even though PS and the doc carry it. The runtime's deterministic rendered-PNG name
         // (`text_image_file_name`) is the same the doc's text flush writes, so a later placement-save
         // round-trips.
+        // The deform mesh control points are stored in absolute PAGE pixels, so the runtime mesh must be
+        // clamped against the page size — NOT the text bitmap size (`image.size`). Passing the (much
+        // smaller) bitmap size collapses the full-page control points into a degenerate box near the page
+        // origin, making deformed text vanish on the frame after a drag-release round-trips through the
+        // doc. Resolved once here because `page` holds an immutable borrow of `doc` across the loop.
+        let page_size_px = self.page_size_px(page_idx);
         let mut to_requeue: Vec<usize> = Vec::new();
         for node in &page.nodes {
             let NodeBody::Text { render_data, image, mask_clip, .. } = &node.body else {
@@ -508,7 +514,7 @@ impl TypingTextOverlayLayer {
             let user_scale = node.transform.scale;
             let size_px = image.size;
             let deform_mesh = node.deform.as_ref().and_then(|d| {
-                TypingOverlayDeformMesh::new(d.cols, d.rows, d.points_px.clone(), size_px)
+                TypingOverlayDeformMesh::new(d.cols, d.rows, d.points_px.clone(), page_size_px)
             });
             let render_data_json = if render_data.is_null() {
                 None
