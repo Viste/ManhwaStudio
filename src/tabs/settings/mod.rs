@@ -18,6 +18,7 @@ mod ai_backend;
 mod canvas_ribbon;
 mod general;
 mod hotkeys;
+#[cfg(feature = "tutorial")]
 mod tutorials;
 
 use crate::ai_backend_panel::AiBackendPanelState;
@@ -75,6 +76,7 @@ pub(super) enum SettingsPane {
     CanvasRibbon,
     AiBackend,
     Hotkeys,
+    #[cfg(feature = "tutorial")]
     Tutorials,
 }
 
@@ -102,7 +104,9 @@ pub struct SettingsTabState {
     ai_backend_panel: AiBackendPanelState,
     /// Progress model behind the shared "Обучение" pane. Loaded here since the
     /// studio has no tutorial controller yet; resets persist to config and take
-    /// effect on the next launcher run (or future studio tutorials).
+    /// effect on the next launcher run (or future studio tutorials). Gated behind
+    /// the `tutorial` feature (off by default).
+    #[cfg(feature = "tutorial")]
     tutorial_progress: crate::tutorial::TutorialProgressHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
     hotkey_capture_command_id: Option<String>,
@@ -145,6 +149,7 @@ impl SettingsTabState {
             spellcheck_words_revision_seen: current_spellcheck_words_revision(),
             ai_backend_handle,
             ai_backend_panel: AiBackendPanelState::default(),
+            #[cfg(feature = "tutorial")]
             tutorial_progress: crate::tutorial::shared_progress(),
             dragged_bubble_condition_node: None,
             hotkey_capture_command_id: None,
@@ -216,9 +221,12 @@ impl SettingsTabState {
             if ui.selectable_label(selected, "Горячие клавиши").clicked() {
                 self.active_pane = SettingsPane::Hotkeys;
             }
-            let selected = self.active_pane == SettingsPane::Tutorials;
-            if ui.selectable_label(selected, "Обучение").clicked() {
-                self.active_pane = SettingsPane::Tutorials;
+            #[cfg(feature = "tutorial")]
+            {
+                let selected = self.active_pane == SettingsPane::Tutorials;
+                if ui.selectable_label(selected, "Обучение").clicked() {
+                    self.active_pane = SettingsPane::Tutorials;
+                }
             }
         });
         ui.separator();
@@ -228,6 +236,7 @@ impl SettingsTabState {
             SettingsPane::CanvasRibbon => self.draw_canvas_ribbon(ui),
             SettingsPane::AiBackend => self.draw_ai_backend(ui),
             SettingsPane::Hotkeys => self.draw_hotkeys(ui, hotkeys_v2),
+            #[cfg(feature = "tutorial")]
             SettingsPane::Tutorials => self.draw_tutorials(ui),
         }
 

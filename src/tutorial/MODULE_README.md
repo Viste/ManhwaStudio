@@ -1,6 +1,13 @@
 # Module: src/tutorial
 
 ## Purpose
+Gated behind the `tutorial` cargo feature (off by default): the integration
+points (`mod tutorial`, controller fields, `mark`/autoplay/`sync`/`render` calls,
+and the "Обучение" settings panes) are `#[cfg(feature = "tutorial")]` in their
+host surfaces, so a default build compiles the whole subsystem out. This module's
+own files still compile — the demo bin `src/bin/tutorial_test` mounts `engine.rs`
+via `#[path]` independently of the feature.
+
 Shared in-app tutorial / onboarding layer. One overlay engine dims the viewport
 except a spotlighted target, draws a dashed outline + arrow + text callout, and
 absorbs all input beneath it. Each *tutorial* is a named list of steps; a surface
@@ -32,10 +39,16 @@ dim; fix it to use `Response::contains_pointer`/`hovered`).
 
 ## Files and submodules
 - `engine.rs`: the reusable overlay (`TutorialRegistry`, `TutorialStep<C>`,
-  `Tutorial<C>`). Dependency-light (egui + std) because the demo bin
-  `src/bin/tutorial_test/main.rs` mounts it via `#[path]`; do not add crate deps
-  here. `with_dim_alpha` lets a surface lighten the dim (the launcher does, to
-  keep its wallpaper visible).
+  `Tutorial<C>`). Dependency-light (egui + std, so it uses `eprintln!` not the
+  structured logger) because the demo bin `src/bin/tutorial_test/main.rs` mounts
+  it via `#[path]`; do not add crate deps here. Step builders: `.id()` (label for
+  jumps), `.on_enter()`, `.choice(label, goto)` (branch button), `.await_gate()`
+  (auto-advance when the gate holds — a spinner shows meanwhile), `.gated()`
+  (disable "Далее" until the gate holds), `.link()/.finish()` (override where the
+  step goes). `TutorialStep::message()` builds a target-less step (whole viewport
+  dimmed, centred callout). Navigation is a history stack, so "Назад" is correct
+  across branch jumps. `with_dim_alpha`/`with_callout_tint` let a surface soften
+  the dim / back the callout (the launcher does, to keep its wallpaper visible).
 - `id.rs`: `TutorialId` central enum — stable persistence `key`, display `title`,
   `is_available` (which ids the replay pane shows), exhaustive `ALL`.
 - `progress.rs`: `TutorialProgress` (completed-set + autoplay) + persistence to
@@ -50,10 +63,28 @@ dim; fix it to use `Response::contains_pointer`/`hovered`).
 Per-surface step scripts live next to their UI, NOT here (e.g.
 `src/launcher/tutorial.rs`).
 
+## Gates and driving actions
+A gate (`.await_gate`/`.gated`) is a `Fn(&GateCtx<C>) -> bool` evaluated in `sync`
+(has `&C` + the previous frame's registry). To wait on an app state, `C` must
+expose it; to wait on an element, use `g.has_target(key)`. `sync` runs `on_enter`
+on the ENTRY frame WITHOUT evaluating the gate (so an action triggered in
+`on_enter` takes effect before the gate is first checked), and advances at most
+one step per frame.
+
+When a step must trigger something the surface guards behind `&mut self` (the
+new-project pipeline), the step can't hold a reference to it. Use a
+COMMAND/SNAPSHOT context: `C` carries a state snapshot (read by gates) plus a
+command queue (written by `on_enter`); the surface drains and executes the
+commands after `sync` returns. See `src/launcher/new_project/tutorial.rs` +
+`window.rs`.
+
 ## Contracts and invariants
-- Per-frame order: `begin_frame()` → optional `maybe_autoplay(id)` (edge-triggered
-  by the caller) → `sync(&mut ctx)` before building the UI → `mark(key, rect)` at
-  widgets → `render(ctx)` last. `render` persists completion on the finish edge.
+- Per-frame order: optional `maybe_autoplay(id)` (edge-triggered by the caller) →
+  `sync(&mut ctx)` before building the UI → `begin_frame()` → `mark(key, rect)` at
+  widgets → `render(ctx)` last. `sync` uses the previous frame's registry (still
+  intact until `begin_frame`); `render` persists completion on the finish edge.
+- A branch id in `.choice`/`.link(Goto(..))` must match some step's `.id`; a
+  dangling id ends the tutorial (logged) rather than hanging.
 - `TutorialId::key` is the on-disk key: never change an existing value.
 - The overlay covers only its own viewport; detached child viewports are not
   dimmed.

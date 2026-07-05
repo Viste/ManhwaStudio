@@ -106,6 +106,13 @@ impl TutorialRegistry {
         self.rects.insert(key, rect);
     }
 
+    /// Whether `key` was marked this frame — used by step gates that wait for an
+    /// element to appear.
+    #[must_use]
+    pub fn contains(&self, key: &'static str) -> bool {
+        self.rects.contains_key(key)
+    }
+
     /// Bounding union of the rects for every present key in `keys`, or `None`
     /// when none of them was marked this frame (e.g. the target is off-screen).
     #[must_use]
@@ -119,36 +126,98 @@ impl TutorialRegistry {
 /// Side effect run when a step is entered, with the app's mutable context `C`.
 type EnterAction<C> = Box<dyn FnMut(&mut C)>;
 
-/// One tutorial step: which element(s) to highlight, what to say, and an optional
-/// side effect to run when the step becomes current.
+/// Predicate that decides when a gated step may advance. Receives read access to
+/// the app context `C` and the per-frame target registry (via [`GateCtx`]).
+type Gate<C> = Box<dyn Fn(&GateCtx<'_, C>) -> bool>;
+
+/// Where a step goes when it advances. The default is [`StepNext::Linear`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepNext {
+    /// The next step in the list; finishes the tutorial if past the end.
+    Linear,
+    /// Jump to the step whose [`TutorialStep::id`] equals this key. An unknown id
+    /// finishes the tutorial (logged) rather than panicking.
+    Goto(&'static str),
+    /// End the tutorial. Use on the last step of a branch that is not last in the
+    /// list, so `Linear` does not fall through into the next branch.
+    Finish,
+}
+
+/// A branch choice shown as its own callout button. Selecting it applies `next`.
+struct TutorialChoice {
+    label: String,
+    next: StepNext,
+}
+
+/// How a step advances past itself.
+enum Advance<C> {
+    /// "Далее" is always enabled (default).
+    Manual,
+    /// Wait for `gate`. When `auto`, the step advances by itself as soon as the
+    /// gate holds (a spinner shows meanwhile); otherwise "Далее" is shown but
+    /// stays disabled until the gate holds.
+    Await { gate: Gate<C>, auto: bool },
+}
+
+/// Read-only view handed to a step gate: the app context plus element presence.
+pub struct GateCtx<'a, C> {
+    /// The app context snapshot for this frame.
+    pub ctx: &'a C,
+    registry: &'a TutorialRegistry,
+}
+
+impl<C> GateCtx<'_, C> {
+    /// Whether a target element was marked this frame (i.e. is on screen).
+    #[must_use]
+    pub fn has_target(&self, key: &'static str) -> bool {
+        self.registry.contains(key)
+    }
+}
+
+/// One tutorial step: which element(s) to highlight, what to say, an optional
+/// side effect on entry, optional branch choices, an advance gate, and where it
+/// goes next.
 ///
 /// `on_enter` lets the tutorial drive the app's own state (open a tab, set a
-/// mode) without the UI knowing about the tutorial: the widget code is untouched;
-/// the step, defined in the tutorial script, just mutates the app context.
+/// mode, trigger an action) without the UI knowing about the tutorial. A step
+/// with an empty `targets` list has no spotlight: the whole viewport is dimmed
+/// and the callout is centred (used for intro/branch/summary steps).
 pub struct TutorialStep<C> {
+    /// Stable label so [`StepNext::Goto`] / choices can jump to this step.
+    id: Option<&'static str>,
     /// Keys of the target element(s); the hole is the union of their rects.
-    pub targets: Vec<&'static str>,
+    targets: Vec<&'static str>,
     /// Bold heading shown at the top of the callout.
-    pub title: String,
+    title: String,
     /// Body text of the callout.
-    pub body: String,
+    body: String,
     /// Runs once each time this step becomes current (see [`Tutorial::sync`]).
-    pub on_enter: Option<EnterAction<C>>,
+    on_enter: Option<EnterAction<C>>,
+    /// Branch choices; when non-empty the callout shows one button per choice
+    /// instead of the "Далее" row.
+    choices: Vec<TutorialChoice>,
+    /// Gate controlling when the step may advance.
+    advance: Advance<C>,
+    /// Where "Далее" / auto-advance goes.
+    next: StepNext,
 }
 
 impl<C> std::fmt::Debug for TutorialStep<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TutorialStep")
+            .field("id", &self.id)
             .field("targets", &self.targets)
             .field("title", &self.title)
             .field("body", &self.body)
             .field("has_on_enter", &self.on_enter.is_some())
+            .field("choices", &self.choices.len())
+            .field("next", &self.next)
             .finish()
     }
 }
 
 impl<C> TutorialStep<C> {
-    /// Build a highlight-only step from target keys plus title and body text.
+    /// Build a highlight step from target keys plus title and body text.
     #[must_use]
     pub fn new(
         targets: impl IntoIterator<Item = &'static str>,
@@ -156,31 +225,110 @@ impl<C> TutorialStep<C> {
         body: impl Into<String>,
     ) -> Self {
         Self {
+            id: None,
             targets: targets.into_iter().collect(),
             title: title.into(),
             body: body.into(),
             on_enter: None,
+            choices: Vec::new(),
+            advance: Advance::Manual,
+            next: StepNext::Linear,
         }
     }
 
-    /// Attach a side effect run when this step is entered, e.g. to open a tab so
-    /// the tutorial can move the UI to where the next highlight lives.
+    /// Build a target-less step: no spotlight, whole viewport dimmed, callout
+    /// centred. For intros, branch prompts, and summaries.
+    #[must_use]
+    pub fn message(title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self::new(std::iter::empty(), title, body)
+    }
+
+    /// Give the step a stable label so choices / [`StepNext::Goto`] can target it.
+    #[must_use]
+    pub fn id(mut self, id: &'static str) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Attach a side effect run when this step is entered, e.g. to open a tab or
+    /// (via a command sink in `C`) trigger an action. Runs on forward entry AND
+    /// on "Назад" re-entry, so keep it idempotent.
     #[must_use]
     pub fn on_enter(mut self, action: impl FnMut(&mut C) + 'static) -> Self {
         self.on_enter = Some(Box::new(action));
         self
+    }
+
+    /// Add a branch choice button that jumps to the step with id `goto`. Repeat
+    /// for multiple choices; any choice replaces the normal "Далее" row.
+    #[must_use]
+    pub fn choice(mut self, label: impl Into<String>, goto: &'static str) -> Self {
+        self.choices.push(TutorialChoice {
+            label: label.into(),
+            next: StepNext::Goto(goto),
+        });
+        self
+    }
+
+    /// Auto-advance as soon as `gate` holds (a spinner shows while waiting). Use
+    /// for steps that trigger an async action and wait for it to finish.
+    #[must_use]
+    pub fn await_gate(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + 'static) -> Self {
+        self.advance = Advance::Await {
+            gate: Box::new(gate),
+            auto: true,
+        };
+        self
+    }
+
+    /// Show "Далее" but keep it disabled until `gate` holds (user controls pace).
+    #[must_use]
+    pub fn gated(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + 'static) -> Self {
+        self.advance = Advance::Await {
+            gate: Box::new(gate),
+            auto: false,
+        };
+        self
+    }
+
+    /// Override where the step advances to (default [`StepNext::Linear`]).
+    #[must_use]
+    pub fn link(mut self, next: StepNext) -> Self {
+        self.next = next;
+        self
+    }
+
+    /// Shorthand for `.link(StepNext::Finish)` — end the tutorial after this step.
+    #[must_use]
+    pub fn finish(self) -> Self {
+        self.link(StepNext::Finish)
     }
 }
 
 /// What a callout button requested this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalloutAction {
-    /// Advance to the next step (or finish on the last step).
-    Next,
-    /// Go back to the previous step.
-    Prev,
+    /// Advance following the current step's `next` link.
+    Advance,
+    /// Go back to the previously shown step.
+    Back,
     /// End the tutorial immediately.
     Stop,
+    /// Jump per a chosen branch.
+    Go(StepNext),
+}
+
+/// Enabled/disabled/spinner state of the "Далее" button for the current step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextButton {
+    /// Shown and clickable.
+    Enabled,
+    /// Shown but disabled (a manual gate is not yet satisfied).
+    Disabled,
+    /// Replaced by a spinner + "Ожидание…" (auto gate is waiting).
+    Waiting,
+    /// Not shown at all (the step uses choice buttons instead).
+    Hidden,
 }
 
 /// The zone of the viewport (relative to its centre) that the highlight sits in.
@@ -214,7 +362,9 @@ struct CalloutPlacement {
 /// context `C` that step `on_enter` side effects mutate.
 pub struct Tutorial<C> {
     steps: Vec<TutorialStep<C>>,
-    current: usize,
+    /// Visited step indices; the last entry is the current step. A stack (not a
+    /// single index) so "Назад" is correct across branch jumps.
+    history: Vec<usize>,
     active: bool,
     /// Extra points added around the target rect before dimming/outlining.
     padding: f32,
@@ -230,13 +380,19 @@ pub struct Tutorial<C> {
     callout_tint: Option<Color32>,
     /// Whether the current step's `on_enter` side effect has already run.
     entered: bool,
+    /// Cached result of the current step's gate, refreshed each `sync` (render
+    /// has no `&C`, so it reads this to enable/disable "Далее").
+    gate_satisfied: bool,
+    /// True when no step branches or gates — enables the "N / M" step counter.
+    /// Branched tutorials show only the visited-step ordinal.
+    linear: bool,
 }
 
 impl<C> std::fmt::Debug for Tutorial<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tutorial")
             .field("steps", &self.steps.len())
-            .field("current", &self.current)
+            .field("history", &self.history)
             .field("active", &self.active)
             .field("entered", &self.entered)
             .finish()
@@ -247,15 +403,22 @@ impl<C> Tutorial<C> {
     /// Create an inactive tutorial from an ordered list of steps.
     #[must_use]
     pub fn new(steps: Vec<TutorialStep<C>>) -> Self {
+        // A tutorial is "linear" (eligible for the N/M counter) only when every
+        // step falls through in order with no branch buttons and no jump/finish.
+        let linear = steps.iter().all(|step| {
+            step.choices.is_empty() && matches!(step.next, StepNext::Linear)
+        });
         Self {
             steps,
-            current: 0,
+            history: Vec::new(),
             active: false,
             padding: 6.0,
             last_callout_size: Vec2::new(CALLOUT_WIDTH + 20.0, 130.0),
             dim_alpha: DEFAULT_DIM_ALPHA,
             callout_tint: None,
             entered: false,
+            gate_satisfied: false,
+            linear,
         }
     }
 
@@ -286,9 +449,10 @@ impl<C> Tutorial<C> {
         if self.steps.is_empty() {
             return;
         }
-        self.current = 0;
+        self.history = vec![0];
         self.active = true;
         self.entered = false;
+        self.gate_satisfied = false;
     }
 
     /// Stop the tutorial and hide the overlay.
@@ -296,45 +460,113 @@ impl<C> Tutorial<C> {
         self.active = false;
     }
 
-    /// Run the current step's `on_enter` side effect once per entry. Call this at
-    /// the START of the frame, before building the UI, so a step that opens a tab
-    /// takes effect the same frame its highlight target is drawn. Passing the
-    /// app's mutable state lets the tutorial change UI state without the widgets
-    /// knowing about it. No-op while inactive or once the step has been entered.
-    pub fn sync(&mut self, app: &mut C) {
-        if !self.active || self.entered {
+    /// Index of the current step (top of the history stack). Only meaningful
+    /// while active; defaults to 0 otherwise.
+    fn current(&self) -> usize {
+        self.history.last().copied().unwrap_or(0)
+    }
+
+    /// Find a step by its `id` label.
+    fn index_of(&self, id: &'static str) -> Option<usize> {
+        self.steps.iter().position(|step| step.id == Some(id))
+    }
+
+    /// Advance/drive the tutorial once per frame. Call at the START of the frame,
+    /// before building the UI, with the app context `C` and this frame's registry
+    /// (the previous frame's marks — begin_frame has not run yet).
+    ///
+    /// On the frame a step is entered it runs `on_enter` and does NOT evaluate its
+    /// gate (so an action triggered in `on_enter` takes effect first). On later
+    /// frames it evaluates the gate: an auto-gate advances the step; a manual gate
+    /// only caches its result so `render` can enable "Далее". At most one step is
+    /// taken per frame, so every step gets its own entry frame.
+    pub fn sync(&mut self, app: &mut C, registry: &TutorialRegistry) {
+        if !self.active {
             return;
         }
-        self.entered = true;
-        if let Some(step) = self.steps.get_mut(self.current)
-            && let Some(action) = step.on_enter.as_mut()
-        {
-            action(app);
+        let idx = self.current();
+        if !self.entered {
+            self.entered = true;
+            self.gate_satisfied = false;
+            if let Some(step) = self.steps.get_mut(idx)
+                && let Some(action) = step.on_enter.as_mut()
+            {
+                action(app);
+            }
+            return;
+        }
+
+        let Some(step) = self.steps.get(idx) else {
+            self.active = false;
+            return;
+        };
+        let (satisfied, auto, next) = match &step.advance {
+            Advance::Manual => (true, false, step.next),
+            Advance::Await { gate, auto } => {
+                let gate_ctx = GateCtx {
+                    ctx: &*app,
+                    registry,
+                };
+                (gate(&gate_ctx), *auto, step.next)
+            }
+        };
+        self.gate_satisfied = satisfied;
+        if satisfied && auto {
+            self.go(next);
         }
     }
 
-    /// Apply a callout action, ending the tutorial when it runs off either end.
-    /// Any step change re-arms `on_enter` so it runs again on the next `sync`.
-    fn apply(&mut self, action: CalloutAction) {
-        match action {
-            CalloutAction::Next => {
-                if self.current + 1 >= self.steps.len() {
+    /// Follow a `StepNext` link, ending the tutorial when it runs off the list or
+    /// targets an unknown id. Re-arms `on_enter` for the entered step.
+    fn go(&mut self, next: StepNext) {
+        match next {
+            StepNext::Linear => {
+                let n = self.current() + 1;
+                if n >= self.steps.len() {
                     self.active = false;
                 } else {
-                    self.current += 1;
+                    self.history.push(n);
                     self.entered = false;
                 }
             }
-            CalloutAction::Prev => {
-                let prev = self.current;
-                self.current = self.current.saturating_sub(1);
-                if self.current != prev {
+            StepNext::Goto(id) => match self.index_of(id) {
+                Some(n) => {
+                    self.history.push(n);
                     self.entered = false;
                 }
-            }
-            CalloutAction::Stop => {
+                None => {
+                    // A dangling id is a script bug; surface it loudly (the engine
+                    // stays dependency-light for the demo bin, so no structured
+                    // logger here) and end rather than hang.
+                    eprintln!("[tutorial] step id '{id}' not found; ending tutorial");
+                    self.active = false;
+                }
+            },
+            StepNext::Finish => {
                 self.active = false;
             }
+        }
+    }
+
+    /// Return to the previously shown step (pops the history stack). No-op at the
+    /// first step. Re-runs the previous step's `on_enter`.
+    fn back(&mut self) {
+        if self.history.len() > 1 {
+            self.history.pop();
+            self.entered = false;
+        }
+    }
+
+    /// Apply a callout button action.
+    fn apply(&mut self, action: CalloutAction) {
+        match action {
+            CalloutAction::Advance => {
+                let next = self.steps[self.current()].next;
+                self.go(next);
+            }
+            CalloutAction::Back => self.back(),
+            CalloutAction::Stop => self.active = false,
+            CalloutAction::Go(next) => self.go(next),
         }
     }
 
@@ -344,15 +576,50 @@ impl<C> Tutorial<C> {
         if !self.active {
             return;
         }
-        let Some(step) = self.steps.get(self.current) else {
+        let idx = self.current();
+        let Some(step) = self.steps.get(idx) else {
             self.active = false;
             return;
         };
-        // Copy the small display data (not the `on_enter` closure) so `self` can
-        // be mutated after (button clicks) without holding a borrow across render.
+        // Snapshot the small display data so `self` can be mutated after (button
+        // clicks) without holding a borrow across the callout UI.
         let targets = step.targets.clone();
         let title = step.title.clone();
         let body = step.body.clone();
+        let choices: Vec<(String, StepNext)> = step
+            .choices
+            .iter()
+            .map(|choice| (choice.label.clone(), choice.next))
+            .collect();
+        // "Готово" vs "Далее": whether advancing ends the tutorial.
+        let terminal = match step.next {
+            StepNext::Finish => true,
+            StepNext::Linear => idx + 1 >= self.steps.len(),
+            StepNext::Goto(id) => self.index_of(id).is_none(),
+        };
+        let auto_step = matches!(step.advance, Advance::Await { auto: true, .. });
+        let next_button = if !choices.is_empty() {
+            NextButton::Hidden
+        } else {
+            match step.advance {
+                Advance::Manual => NextButton::Enabled,
+                Advance::Await { auto: true, .. } => NextButton::Waiting,
+                Advance::Await { auto: false, .. } => {
+                    if self.gate_satisfied {
+                        NextButton::Enabled
+                    } else {
+                        NextButton::Disabled
+                    }
+                }
+            }
+        };
+        // No "Назад" out of a fork or an auto-advancing step (nothing to pause on).
+        let show_back = self.history.len() > 1 && choices.is_empty() && !auto_step;
+        let counter = if self.linear {
+            format!("{} / {}", idx + 1, self.steps.len())
+        } else {
+            format!("Шаг {}", self.history.len())
+        };
 
         let screen = ctx.viewport_rect();
         let hole = registry
@@ -376,18 +643,17 @@ impl<C> Tutorial<C> {
         };
 
         // 3. Callout box (interactive, above the dim). Returns any button action.
-        let is_first = self.current == 0;
-        let is_last = self.current + 1 >= self.steps.len();
         let (callout_rect, action) = Self::show_callout(
             ctx,
             screen,
             callout_pos,
             &title,
             &body,
-            self.current + 1,
-            self.steps.len(),
-            is_first,
-            is_last,
+            &counter,
+            &choices,
+            next_button,
+            terminal,
+            show_back,
             self.callout_tint,
         );
         self.last_callout_size = callout_rect.size();
@@ -396,6 +662,10 @@ impl<C> Tutorial<C> {
         if let (Some(hole), Some(placement)) = (hole, placement) {
             Self::paint_decoration(ctx, hole, placement.tail, placement.tip);
         }
+
+        // Keep the frame loop alive while active so gates that wait on async ops
+        // are polled even when the surface is otherwise idle.
+        ctx.request_repaint();
 
         if let Some(action) = action {
             self.apply(action);
@@ -468,10 +738,11 @@ impl<C> Tutorial<C> {
         pos: Pos2,
         title: &str,
         body: &str,
-        step_number: usize,
-        step_total: usize,
-        is_first: bool,
-        is_last: bool,
+        counter: &str,
+        choices: &[(String, StepNext)],
+        next_button: NextButton,
+        terminal: bool,
+        show_back: bool,
         callout_tint: Option<Color32>,
     ) -> (Rect, Option<CalloutAction>) {
         // constrain(false): keep the exact position so the arrow enters/leaves at
@@ -516,28 +787,79 @@ impl<C> Tutorial<C> {
                         // 3-button footer (Пропустить/Назад/Готово) can grow left
                         // past a same-line counter and overlap it, so the two
                         // never share a row.
-                        ui.weak(format!("{step_number} / {step_total}"));
+                        ui.weak(counter);
                         ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let next_label = if is_last { "Готово" } else { "Далее" };
-                                if ui.button(next_label).clicked() {
-                                    action = Some(CalloutAction::Next);
-                                }
-                                if !is_first && ui.button("Назад").clicked() {
-                                    action = Some(CalloutAction::Prev);
-                                }
-                                if ui.button("Пропустить").clicked() {
-                                    action = Some(CalloutAction::Stop);
-                                }
-                            });
-                        });
+                        if choices.is_empty() {
+                            Self::show_nav_row(ui, next_button, terminal, show_back, &mut action);
+                        } else {
+                            Self::show_choice_buttons(ui, choices, &mut action);
+                        }
                         action
                     })
                     .inner
             });
 
         (inner.response.rect, inner.inner)
+    }
+
+    /// Render the standard footer row: "Далее" (per `next_button`), optional
+    /// "Назад", and "Пропустить", right-aligned.
+    fn show_nav_row(
+        ui: &mut egui::Ui,
+        next_button: NextButton,
+        terminal: bool,
+        show_back: bool,
+        action: &mut Option<CalloutAction>,
+    ) {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let next_label = if terminal { "Готово" } else { "Далее" };
+                match next_button {
+                    NextButton::Enabled => {
+                        if ui.button(next_label).clicked() {
+                            *action = Some(CalloutAction::Advance);
+                        }
+                    }
+                    NextButton::Disabled => {
+                        ui.add_enabled(false, egui::Button::new(next_label));
+                    }
+                    NextButton::Waiting => {
+                        ui.add(egui::Spinner::new().size(16.0));
+                        ui.label("Ожидание…");
+                    }
+                    NextButton::Hidden => {}
+                }
+                if show_back && ui.button("Назад").clicked() {
+                    *action = Some(CalloutAction::Back);
+                }
+                if ui.button("Пропустить").clicked() {
+                    *action = Some(CalloutAction::Stop);
+                }
+            });
+        });
+    }
+
+    /// Render a branch step's choice buttons (full width, stacked) plus a
+    /// right-aligned "Пропустить".
+    fn show_choice_buttons(
+        ui: &mut egui::Ui,
+        choices: &[(String, StepNext)],
+        action: &mut Option<CalloutAction>,
+    ) {
+        for (label, next) in choices {
+            if ui
+                .add_sized([CALLOUT_WIDTH, 28.0], egui::Button::new(label))
+                .clicked()
+            {
+                *action = Some(CalloutAction::Go(*next));
+            }
+        }
+        ui.add_space(4.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Пропустить").clicked() {
+                *action = Some(CalloutAction::Stop);
+            }
+        });
     }
 
     /// Resolve the callout position and the fixed-length arrow from the zone the
@@ -667,4 +989,95 @@ fn anchor_fraction(dir: Vec2) -> Vec2 {
         }
     };
     Vec2::new(frac(dir.x), frac(dir.y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct Ctx {
+        ready: bool,
+        entered: Vec<&'static str>,
+    }
+
+    fn build() -> Tutorial<Ctx> {
+        Tutorial::new(vec![
+            TutorialStep::message("intro", "")
+                .id("intro")
+                .choice("A", "a")
+                .choice("B", "b"),
+            TutorialStep::message("a", "")
+                .id("a")
+                .on_enter(|c: &mut Ctx| c.entered.push("a"))
+                .await_gate(|g| g.ctx.ready),
+            TutorialStep::message("a2", "").id("a2").finish(),
+            TutorialStep::message("b", "").id("b").finish(),
+        ])
+    }
+
+    #[test]
+    fn branch_choice_jumps_to_labeled_step() {
+        let mut t = build();
+        t.start();
+        assert!(t.is_active());
+        assert_eq!(t.current(), 0);
+        // A branched tutorial is not "linear" (no N/M counter).
+        assert!(!t.linear);
+        t.apply(CalloutAction::Go(StepNext::Goto("b")));
+        assert_eq!(t.current(), 3);
+        // "b" is a finish step; advancing ends the tutorial.
+        t.apply(CalloutAction::Advance);
+        assert!(!t.is_active());
+    }
+
+    #[test]
+    fn auto_gate_waits_then_advances() {
+        let reg = TutorialRegistry::default();
+        let mut ctx = Ctx::default();
+        let mut t = build();
+        t.start();
+        t.apply(CalloutAction::Go(StepNext::Goto("a")));
+        assert_eq!(t.current(), 1);
+        // Entry frame: on_enter runs, gate NOT evaluated (no advance).
+        t.sync(&mut ctx, &reg);
+        assert_eq!(ctx.entered, vec!["a"]);
+        assert_eq!(t.current(), 1);
+        // Gate false: stays put.
+        t.sync(&mut ctx, &reg);
+        assert_eq!(t.current(), 1);
+        assert!(!t.gate_satisfied);
+        // Gate true: auto-advances one step.
+        ctx.ready = true;
+        t.sync(&mut ctx, &reg);
+        assert_eq!(t.current(), 2);
+    }
+
+    #[test]
+    fn back_pops_history_across_a_jump() {
+        let mut t = build();
+        t.start();
+        t.apply(CalloutAction::Go(StepNext::Goto("a")));
+        assert_eq!(t.current(), 1);
+        t.apply(CalloutAction::Back);
+        assert_eq!(t.current(), 0);
+        // Back at the first step is a no-op.
+        t.apply(CalloutAction::Back);
+        assert_eq!(t.current(), 0);
+    }
+
+    #[test]
+    fn linear_tutorial_is_flagged() {
+        let t: Tutorial<Ctx> = Tutorial::new(vec![
+            TutorialStep::new(["x"], "1", ""),
+            TutorialStep::new(["y"], "2", ""),
+        ]);
+        assert!(t.linear);
+    }
+
+    #[test]
+    fn message_step_has_no_targets() {
+        let step: TutorialStep<Ctx> = TutorialStep::message("t", "b");
+        assert!(step.targets.is_empty());
+    }
 }

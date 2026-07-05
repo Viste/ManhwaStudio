@@ -59,6 +59,13 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   restoration.
 - `batch_processing/`: standalone visual graph editor and executor for repeated import/download,
   browser, stitch, waifu2x, and save pipelines. See `batch_processing/MODULE_README.md`.
+- `tutorial.rs`: branching onboarding tour (`TutorialId::NewProject`). `window.rs` owns a
+  `TutorialController<NpTutorialCtx>` rendered in THIS viewport. Because the pipeline triggers are
+  private `&mut self` methods, the tutorial drives them via a command/snapshot context: `on_enter`
+  pushes `NpTutorialCommand`s that `show()` drains into `apply_tutorial_command` after `sync`, and
+  gates read `tutorial_snapshot()` (busy / ribbon-has-pages / waifu-available). The visual branch
+  triggers a real test-download → stitch → waifu2x, each step waiting on `!busy`; the explain branch
+  only switches the panel mode and highlights sections.
 
 ## Contracts and invariants
 - GUI code must only poll worker state. Decoding, filesystem traversal, archive extraction,

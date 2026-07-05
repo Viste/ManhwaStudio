@@ -33,6 +33,7 @@ pub mod pages;
 pub mod psd_import_window;
 pub mod state;
 pub mod theme;
+#[cfg(feature = "tutorial")]
 pub mod tutorial;
 
 use crate::ai_backend_supervisor::AiBackendHandle;

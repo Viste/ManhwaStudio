@@ -190,7 +190,8 @@ impl eframe::App for TutorialTestApp {
 
         // Run any pending step `on_enter` BEFORE building the UI, so a step that
         // opens a tab takes effect this frame and its highlight target is drawn.
-        tutorial.sync(active_tab);
+        // Uses the previous frame's registry (still intact until begin_frame).
+        tutorial.sync(active_tab, registry);
 
         registry.begin_frame();
 

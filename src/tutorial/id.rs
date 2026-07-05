@@ -99,9 +99,8 @@ impl TutorialId {
     #[must_use]
     pub fn is_available(self) -> bool {
         match self {
-            TutorialId::LauncherMain => true,
-            TutorialId::NewProject
-            | TutorialId::StudioBase
+            TutorialId::LauncherMain | TutorialId::NewProject => true,
+            TutorialId::StudioBase
             | TutorialId::StudioTranslation
             | TutorialId::StudioCleaning
             | TutorialId::StudioTyping

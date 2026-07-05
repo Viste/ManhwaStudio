@@ -59,6 +59,10 @@ mod tabs;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
 mod tools;
+// Onboarding tutorial subsystem; gated behind the `tutorial` feature (off by
+// default). The demo bin `src/bin/tutorial_test` mounts `engine.rs` directly via
+// `#[path]`, so it stays buildable regardless of this feature.
+#[cfg(feature = "tutorial")]
 mod tutorial;
 pub mod widgets;
 

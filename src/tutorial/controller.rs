@@ -132,10 +132,12 @@ impl<C> TutorialController<C> {
         }
     }
 
-    /// Run the active step's `on_enter` once per entry. Call before building the
-    /// UI so a step that navigates takes effect the same frame.
+    /// Drive the active tutorial one tick: run `on_enter` on entry, evaluate the
+    /// current step's gate, and auto-advance when it holds. Call before building
+    /// the UI (uses the previous frame's registry, which is still intact until
+    /// `begin_frame`).
     pub fn sync(&mut self, ctx: &mut C) {
-        self.tutorial.sync(ctx);
+        self.tutorial.sync(ctx, &self.registry);
     }
 
     /// Draw the overlay for the current step and advance on button clicks. On the

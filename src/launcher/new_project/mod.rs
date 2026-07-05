@@ -18,5 +18,7 @@ pub mod reline;
 pub mod reline_models;
 pub mod ribbon;
 pub mod stitching;
+#[cfg(feature = "tutorial")]
+pub mod tutorial;
 pub mod waifu2x;
 pub mod window;

@@ -64,8 +64,12 @@ use crate::launcher::new_project::stitching::{
 use crate::launcher::new_project::waifu2x::{
     Waifu2xController, Waifu2xEvent, Waifu2xInputImage, Waifu2xOptions,
 };
+#[cfg(feature = "tutorial")]
+use crate::launcher::new_project::tutorial::{self, NpTutorialCommand, NpTutorialCtx};
 use crate::launcher::state::OpenProjectSelection;
 use crate::paste_image;
+#[cfg(feature = "tutorial")]
+use crate::tutorial::{TutorialController, TutorialId, TutorialProgressHandle, TutorialStep};
 use crate::screen_capture::{self, ScreenRect};
 use crate::widgets::{
     ArrowStyle, EditableComboBox, GutterItem, MarkedScrollArea, MarkedScrollOutput, ScrollSpan,
@@ -608,10 +612,23 @@ pub struct NewProjectWindowState {
     pending_open_wiki_guide: bool,
     batch_processing_window_open: bool,
     batch_processing: crate::launcher::new_project::batch_processing::BatchProcessingWindowState,
+    /// Onboarding overlay for THIS viewport (its own controller so the overlay
+    /// renders in the new-project window, not the launcher root). Drives the
+    /// pipeline via commands drained after `sync` (see `tutorial.rs`). Gated
+    /// behind the `tutorial` feature (off by default).
+    #[cfg(feature = "tutorial")]
+    tutorial: TutorialController<NpTutorialCtx>,
+    /// True until the first frame after the window opens; used to edge-trigger
+    /// autoplay. Reset when the window closes so re-opening re-fires the edge.
+    #[cfg(feature = "tutorial")]
+    tutorial_first_frame: bool,
 }
 
 impl NewProjectWindowState {
-    pub fn new(projects_root: PathBuf) -> Self {
+    pub fn new(
+        projects_root: PathBuf,
+        #[cfg(feature = "tutorial")] tutorial_progress: TutorialProgressHandle,
+    ) -> Self {
         let advanced_download = AdvancedDownloadController::new();
         let browser_names = advanced_download.available_browsers().to_vec();
         let site_presets = load_image_url_presets();
@@ -765,9 +782,47 @@ impl NewProjectWindowState {
             batch_processing_window_open: false,
             batch_processing:
                 crate::launcher::new_project::batch_processing::BatchProcessingWindowState::new(),
+            #[cfg(feature = "tutorial")]
+            tutorial: TutorialController::new(
+                tutorial_progress,
+                vec![(
+                    TutorialId::NewProject,
+                    tutorial::steps as fn() -> Vec<TutorialStep<NpTutorialCtx>>,
+                )],
+            ),
+            #[cfg(feature = "tutorial")]
+            tutorial_first_frame: true,
         };
         state.project_catalog.refresh();
         state
+    }
+
+    /// Execute a tutorial-requested action on the whole window state. Called from
+    /// `show` after `sync` drains the command queue, so `self.tutorial` is no
+    /// longer borrowed. Every action is idempotent enough to survive a "Назад"
+    /// re-entry (the pipeline triggers self-guard on in-flight ops).
+    #[cfg(feature = "tutorial")]
+    fn apply_tutorial_command(&mut self, command: NpTutorialCommand) {
+        match command {
+            NpTutorialCommand::SwitchToSimple => self.left_panel_mode = LeftPanelMode::Simple,
+            NpTutorialCommand::SwitchToFull => self.left_panel_mode = LeftPanelMode::Full,
+            NpTutorialCommand::StartTestDownload => self.start_test_chapter_download(),
+            NpTutorialCommand::StartStitchAutoCut => {
+                self.start_stitch_split(StitchSplitMode::AutoCut);
+            }
+            NpTutorialCommand::StartWaifu2x => self.start_waifu2x(),
+        }
+    }
+
+    /// Build this frame's tutorial context snapshot (state the gates read).
+    #[cfg(feature = "tutorial")]
+    fn tutorial_snapshot(&self) -> NpTutorialCtx {
+        NpTutorialCtx {
+            busy: self.active_progress.is_some(),
+            ribbon_has_pages: !self.ribbon.pages().is_empty(),
+            waifu_available: self.waifu2x.unavailable_reason().is_none(),
+            commands: Vec::new(),
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, viewport_class: ViewportClass) -> bool {
@@ -788,6 +843,30 @@ impl NewProjectWindowState {
         self.poll_waifu2x(ctx);
         self.poll_reline(ctx);
         self.poll_reline_model_catalog(ctx);
+
+        // --- Tutorial: autoplay on the open edge, then drive one tick. ---
+        // The whole tutorial is gated behind the `tutorial` feature (off by
+        // default); the controller and its `mark` sites stay compiled but inert.
+        #[cfg(feature = "tutorial")]
+        {
+            // Autoplay only fires once per open (and only if enabled & not completed).
+            if std::mem::take(&mut self.tutorial_first_frame) {
+                self.tutorial.maybe_autoplay(TutorialId::NewProject);
+            }
+            // `sync` runs the current step's `on_enter` (which pushes commands) and
+            // evaluates its gate against this snapshot. The snapshot is built before
+            // `sync` (borrows self read-only); commands are drained AFTER `sync`
+            // returns, so `apply_tutorial_command` gets `&mut self` without aliasing
+            // `self.tutorial`. Executing them here (before the panels render) lets a
+            // mode switch take effect the same frame the step is entered.
+            let mut tutorial_ctx = self.tutorial_snapshot();
+            self.tutorial.sync(&mut tutorial_ctx);
+            self.tutorial.begin_frame();
+            for command in std::mem::take(&mut tutorial_ctx.commands) {
+                self.apply_tutorial_command(command);
+            }
+        }
+
         // A native window is its own viewport but shares the launcher's single egui Context,
         // so its style is global. Switch to this window's dark style for the duration of its
         // rendering and restore the previous (launcher) style afterwards, so it never leaks
@@ -824,8 +903,17 @@ impl NewProjectWindowState {
         {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+        // Overlay last so it draws on top within THIS viewport (its own ctx).
+        #[cfg(feature = "tutorial")]
+        self.tutorial.render(ctx);
+
         if !keep_open {
             self.handle_window_closed();
+            // Re-arm the open edge so re-opening the window can autoplay again.
+            #[cfg(feature = "tutorial")]
+            {
+                self.tutorial_first_frame = true;
+            }
         }
         if let Some(previous_style) = restore_style {
             ctx.set_global_style(previous_style);
@@ -953,7 +1041,9 @@ impl NewProjectWindowState {
     }
 
     fn show_left_panel_mode_tabs(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
+        // `_row` (leading underscore) is only consumed by the feature-gated `mark`
+        // below; the underscore keeps it warning-free when `tutorial` is off.
+        let _row = ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.left_panel_mode,
                 LeftPanelMode::Simple,
@@ -965,6 +1055,8 @@ impl NewProjectWindowState {
                 "Полная панель",
             );
         });
+        #[cfg(feature = "tutorial")]
+        self.tutorial.mark(tutorial::TARGET_MODE_TABS, _row.response.rect);
     }
 
     fn show_full_panel(&mut self, ui: &mut Ui) {
@@ -1194,14 +1286,16 @@ impl NewProjectWindowState {
                             .weak(),
                         );
                         ui.add_space(8.0);
-                        if button_sized(
+                        let test_dl = button_sized(
                             ui,
                             "Скачать тестовую главу",
                             egui::vec2(220.0, 34.0),
                             quick_download_enabled,
-                        )
-                        .clicked()
-                        {
+                        );
+                        #[cfg(feature = "tutorial")]
+                        self.tutorial
+                            .mark(tutorial::TARGET_TEST_DOWNLOAD, test_dl.rect);
+                        if test_dl.clicked() {
                             self.start_test_chapter_download();
                         }
                     },
@@ -1584,14 +1678,15 @@ impl NewProjectWindowState {
 
     fn show_import_section(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
-            if button_sized(
+            let open_folder = button_sized(
                 ui,
                 "Открыть папку...",
                 ACTION_BUTTON_SIZE,
                 !self.source_import.is_loading(),
-            )
-            .clicked()
-            {
+            );
+            #[cfg(feature = "tutorial")]
+            self.tutorial.mark(tutorial::TARGET_IMPORT, open_folder.rect);
+            if open_folder.clicked() {
                 self.open_folder_dialog();
             }
             if button_sized(
@@ -1691,6 +1786,8 @@ impl NewProjectWindowState {
             can_start_download,
         );
         let response = response.on_hover_text(SUPPORTED_SITES_TOOLTIP);
+        #[cfg(feature = "tutorial")]
+        self.tutorial.mark(tutorial::TARGET_QUICK, response.rect);
         if response.clicked() {
             self.start_quick_download();
         }
@@ -2786,8 +2883,10 @@ impl NewProjectWindowState {
         {
             self.start_stitch_split(StitchSplitMode::ManualCutPreview);
         }
-        if button_sized(ui, "Сшить и нарезать автоматически", wide_button, can_start).clicked()
-        {
+        let stitch_auto = button_sized(ui, "Сшить и нарезать автоматически", wide_button, can_start);
+        #[cfg(feature = "tutorial")]
+        self.tutorial.mark(tutorial::TARGET_STITCH, stitch_auto.rect);
+        if stitch_auto.clicked() {
             self.start_stitch_split(StitchSplitMode::AutoCut);
         }
         if button_sized(
@@ -2913,14 +3012,15 @@ impl NewProjectWindowState {
         field_label(ui, "Tile size -t (>=32, 0=auto)");
         ui.add(TextEdit::singleline(&mut self.waifu_tile_size).desired_width(160.0));
 
-        if button_sized(
+        let waifu_run = button_sized(
             ui,
             "Прогнать через waifu2x",
             egui::vec2(LEFT_PANEL_WIDTH - 52.0, 34.0),
             self.can_start_waifu2x(),
-        )
-        .clicked()
-        {
+        );
+        #[cfg(feature = "tutorial")]
+        self.tutorial.mark(tutorial::TARGET_WAIFU, waifu_run.rect);
+        if waifu_run.clicked() {
             self.start_waifu2x();
         }
         self.show_operation_progress(ui, "waifu2x");

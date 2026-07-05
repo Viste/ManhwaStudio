@@ -8,6 +8,12 @@ members = [".", "crates/ms-log", "crates/ms-text-util", "crates/ms-text-render",
 
 [features]
 active-logs = []
+# In-app onboarding tutorial (launcher tour + new-project tour + the "Обучение"
+# settings pane). Off by default: the tutorial controller and its `mark` sites
+# stay compiled but inert, and all autoplay/overlay rendering plus the settings
+# pane are gated out. Enable with `--features tutorial` to restore the tours.
+# The `src/tutorial/` engine itself always compiles (the demo bin depends on it).
+tutorial = []
 # Web (wasm) build switch. Enabled by the wcheck/wbuild aliases and build-wasm.sh.
 # Selects the browser storage/network backends and compiles out native-only
 # subsystems (subprocess AI backend, sockets, dynamic libs). See docs/WEB_PORT.md.

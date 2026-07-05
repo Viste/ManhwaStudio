@@ -16,6 +16,7 @@ use crate::launcher::app::LauncherApp;
 use crate::launcher::pages::base::PageNavAction;
 use crate::launcher::state::LauncherPage;
 use crate::launcher::theme;
+#[cfg(feature = "tutorial")]
 use crate::launcher::tutorial;
 use egui::{Align, Area, Color32, Frame, Grid, Layout, Order, RichText, Stroke, Ui, Vec2};
 
@@ -65,6 +66,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                                 "Открыть главу",
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
+                                            #[cfg(feature = "tutorial")]
                             app.tutorial.mark(tutorial::TARGET_OPEN, open_response.rect);
                             if open_response.clicked() {
                                 app.state.import_popup_open = false;
@@ -75,6 +77,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                                 "Новая глава",
                                 RIGHT_COLUMN_BUTTON_WIDTH,
                             );
+                            #[cfg(feature = "tutorial")]
                             app.tutorial.mark(tutorial::TARGET_NEW, new_response.rect);
                             if new_response.clicked() {
                                 app.state.import_popup_open = false;
@@ -88,6 +91,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
                             import_button_rect = Some(import_response.rect);
+                            #[cfg(feature = "tutorial")]
                             app.tutorial.mark(tutorial::TARGET_IMPORT, import_response.rect);
                             if import_response.clicked() {
                                 app.state.main_page_message = None;
@@ -98,6 +102,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                                 "Экспорт главы",
                                 RIGHT_COLUMN_BUTTON_WIDTH,
                             );
+                            #[cfg(feature = "tutorial")]
                             app.tutorial.mark(tutorial::TARGET_EXPORT, export_response.rect);
                             if export_response.clicked() {
                                 app.state.import_popup_open = false;
@@ -116,6 +121,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                 ui.add_space(12.0);
                 let settings_response =
                     menu_button_response(ui, "Настройки", RIGHT_COLUMN_BUTTON_WIDTH);
+                #[cfg(feature = "tutorial")]
                 app.tutorial.mark(tutorial::TARGET_SETTINGS, settings_response.rect);
                 if settings_response.clicked() {
                     app.state.import_popup_open = false;

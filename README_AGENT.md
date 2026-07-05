@@ -424,6 +424,14 @@ original, and a bbox relative to the sent image) and the model returns
 
 ## Tutorial system (`src/tutorial/`)
 
+**Gated behind the `tutorial` cargo feature (off by default).** With the feature
+off, `mod tutorial`, the `TutorialController` fields/`mark` sites, all
+autoplay/`sync`/`render` calls, and the "Обучение" settings panes (launcher +
+studio) are all compiled out via `#[cfg(feature = "tutorial")]`; nothing tutorial
+renders and no dead code remains. Enable with `--features tutorial` to restore the
+tours. The `src/tutorial/` engine still compiles regardless because the demo bin
+`src/bin/tutorial_test/` mounts `engine.rs` directly via `#[path]`.
+
 Shared onboarding layer. One overlay engine (`engine.rs`) dims the viewport
 except a spotlighted target (dashed outline + arrow + text callout) and absorbs
 **all** input beneath it via a single full-viewport hitbox on `Order::Middle`
@@ -444,11 +452,21 @@ pointer instead of `Response::contains_pointer`/`hovered` leaks under the dim).
   (double interface, like `ai_backend_panel`); depends only on the progress
   handle, so resetting a tutorial re-arms its autoplay on the owning surface.
 
+Steps support **branching** (`.choice(label, goto_id)` + `StepNext::Goto/Finish`,
+navigated by a history stack so "Назад" is correct across jumps) and **waiting**
+(`.await_gate` auto-advances when a `Fn(&GateCtx<C>)->bool` holds; `.gated` just
+disables "Далее"). A target-less step (`TutorialStep::message`) dims the whole
+viewport with a centred callout. When a step must trigger something the surface
+guards behind `&mut self`, `C` is a command-sink + state-snapshot: `on_enter`
+queues commands the surface drains after `sync`, gates read the snapshot.
+
 Per-surface step scripts live next to their UI (e.g. `src/launcher/tutorial.rs`),
 not in the shared module. The demo bin `src/bin/tutorial_test/` mounts `engine.rs`
 via `#[path]` so demo and production never diverge. Currently wired: the launcher
-main-menu tour (`LauncherMain`); studio surfaces are reserved ids for later phases
-(`docs/tutorial-plan.md`).
+main-menu tour (`LauncherMain`) and the branching new-project tour (`NewProject`,
+`src/launcher/new_project/tutorial.rs` — its visual branch drives a real
+download→stitch→waifu2x pipeline, waiting on each op); studio surfaces are
+reserved ids for later phases (`docs/tutorial-plan.md`).
 
 ---
 
